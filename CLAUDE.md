@@ -8,7 +8,7 @@ For template development and modification guidelines, see [CLAUDE_DEV.md](CLAUDE
 
 ## What This Project Does
 
-This is an **AWS CloudFormation reference architecture for Netskope AI Gateway and DLP On Demand**.
+This is an **AWS CloudFormation reference architecture for Netskope AI Gateway (AIG) and DLP On Demand (DLPoD)**.
 It provisions, enrolls, and operates both services automatically — no manual steps after deployment.
 
 The AI Gateway sits inline between applications and LLM providers (Bedrock, OpenAI, etc.),
@@ -46,11 +46,12 @@ The simplest way to perform any task is to ask Claude to read the relevant docum
 Providing credentials as environment variables avoids them appearing in the conversation:
 
 ```bash
-export NETSKOPE_API_KEY=<token>
+export NETSKOPE_TENANT_URL=https://<tenant>.goskope.com
+export NETSKOPE_API_TOKEN=<token>
 export DLPOD_LICENSE_KEY=<license-key>
 ```
 
-Then reference them by name: "use $NETSKOPE_API_KEY for the API token".
+Then reference them by name: "use $NETSKOPE_API_TOKEN for the API token".
 
 ---
 
@@ -60,38 +61,47 @@ Before deploying, confirm:
 
 - [ ] AWS CLI configured (`aws sts get-caller-identity` returns your account)
 - [ ] IAM permissions for CloudFormation, EC2, IAM, ELB, Auto Scaling, Lambda,
-  Secrets Manager, SNS, Route 53, ACM, SSM, CloudWatch — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#5-aws-permissions)
+  Secrets Manager, SNS, Route 53, ACM, SSM, CloudWatch — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#aws-permissions)
 - [ ] AI Gateway AMI subscribed in AWS Marketplace (search "Netskope AI Gateway")
-- [ ] DLP On Demand AMI subscribed in AWS Marketplace (search "Netskope DLP On Demand") — combined and DLPoD templates only
+- [ ] DLP On Demand AMI shared to your AWS account from the Netskope console — it is not on
+  AWS Marketplace. Go to **Security Cloud Platform → On-Premises Infrastructure → Setup DLP On
+  Demand → AWS → Share Image**, enter your AWS account ID and choose the region; the image then
+  appears under EC2 → AMIs → Private images. See the
+  [DLP On Demand config guide](https://docs.netskope.com/en/dlpondemandconfig).
 - [ ] Netskope tenant URL (`https://<tenant>.goskope.com`)
 - [ ] Netskope RBAC v3 API token with AIG Administrator role
-- [ ] DLP On Demand license key — combined and DLPoD templates only
-- [ ] *(Optional AI Guardrails, combined template only)* `aisecurity-llm.tgz` image tarball uploaded to an S3 bucket in the
+- [ ] DLP On Demand license key
+- [ ] *(Optional AI Guardrails)* `aisecurity-llm.tgz` image tarball uploaded to an S3 bucket in the
   target region, a Deep Learning Base GPU AMI ID for the region, and EC2 quota for
-  "Running On-Demand G and VT instances" ≥ 4 vCPU — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#ai-guardrails-optional)
+  "Running On-Demand G and VT instances" ≥ 4 vCPU — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#ai-guardrails-prerequisites-optional)
 
-> **Region:** AMI defaults are for **us-west-1 only**. For other regions, look up the AMI IDs
-> after subscribing and pass them as `GatewayAmiId` / `DlpodAmiId` parameters.
+> **Region:** AMI defaults are for **us-west-1 only**. For the AI Gateway, look up the Marketplace
+> AMI ID for your region after subscribing and pass it as `GatewayAmiId`. For DLP On Demand, the
+> region is chosen when you share the image from the Netskope console; pass the resulting AMI ID
+> as `DlpodAmiId`. The default `DlpodAmiId` (`ami-0973780ab75c2fb28`) launches only if that exact
+> image has been shared to the deploying account in us-west-1.
 
 ---
 
-## Deployment — Combined Template (Quick Reference)
+## Deployment (Quick Reference)
 
 Full instructions: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
 
 ```bash
-# Step 1 — Create S3 bucket and upload template (required — exceeds 51 KB limit)
-scripts/deploy-artifacts.sh <region>
-# Creates bucket netskope-aigw-templates-<account-id>
-# Override bucket: LAMBDA_BUCKET=<name> scripts/deploy-artifacts.sh <region>
-BUCKET=netskope-aigw-templates-<account-id>
+STACK=<stack-name>
 REGION=<region>
+
+# Step 1 — Create S3 bucket and upload template (required — exceeds 51 KB limit)
+scripts/deploy-artifacts.sh $REGION
+# Creates bucket netskope-aigw-templates-<account-id>
+# Override bucket: TEMPLATE_BUCKET=<name> scripts/deploy-artifacts.sh $REGION
+BUCKET=netskope-aigw-templates-<account-id>
 aws s3 cp templates/gateway-combined.yaml \
   s3://$BUCKET/templates/gateway-combined.yaml --region $REGION
 
 # Step 2 — Deploy
 aws cloudformation create-stack \
-  --stack-name <stack-name> \
+  --stack-name $STACK \
   --template-url https://$BUCKET.s3.$REGION.amazonaws.com/templates/gateway-combined.yaml \
   --parameters \
     ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
@@ -106,30 +116,88 @@ aws cloudformation create-stack \
 ```
 
 Stack creation takes **12–18 minutes**. After `CREATE_COMPLETE`, both services are enrolled and
-serving. Check progress: `aws cloudformation describe-stacks --stack-name <name> --query 'Stacks[0].StackStatus' --output text`
+serving. Check progress:
+
+```bash
+aws cloudformation describe-stacks --stack-name $STACK --region $REGION \
+  --query 'Stacks[0].StackStatus' --output text
+```
 
 ---
 
 ## Operations Quick Reference
 
-Full reference: [docs/OPERATIONS.md](docs/OPERATIONS.md)
+Full reference: [docs/OPERATIONS.md](docs/OPERATIONS.md). All commands assume
+`STACK=<stack-name>` and `REGION=<region>` are set.
 
-| Task | Command |
-|---|---|
-| Check AIG instance states | `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <stack>-aig-asg --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" --output table` |
-| Check AIG enrollment | `aws logs tail /aws/lambda/<stack>-aig-activation --since 30m` (look for `Registered appliance`) and `aws elbv2 describe-target-health` on `<stack>-aig-tg` |
-| Scale AIG | `aws autoscaling update-auto-scaling-group --auto-scaling-group-name <stack>-aig-asg --desired-capacity <N>` |
-| View AIG activation logs | `aws logs tail /aws/lambda/<stack>-aig-activation --since 30m` |
-| Check DLPoD instance states | `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <stack>-dlpod-asg --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" --output table` |
-| Check DLPoD bootstrap logs | `aws logs tail /aws/lambda/<stack>-dlpod-bootstrap-builder --since 30m` |
-| Check readiness gate (stack create) | `aws logs tail /aws/lambda/<stack>-dlpod-readiness --since 30m` |
-| Scale DLPoD | `aws autoscaling update-auto-scaling-group --auto-scaling-group-name <stack>-dlpod-asg --desired-capacity <N>` |
-| Check DLPoD target health | `aws elbv2 describe-target-health --target-group-arn $(aws elbv2 describe-target-groups --query "TargetGroups[?contains(TargetGroupName,'<stack>-dlpod')].TargetGroupArn" --output text) --output table` |
-| Check Guardrails target health *(if deployed)* | `aws elbv2 describe-target-health --target-group-arn $(aws elbv2 describe-target-groups --query "TargetGroups[?contains(TargetGroupName,'<stack>-guardrails')].TargetGroupArn" --output text) --output table` |
-| Guardrails container logs *(if deployed)* | `aws ssm start-session --target <instance-id>` then `sudo docker logs guardrails` / `cat /var/log/user-data.log` |
-| Scale Guardrails *(if deployed)* | `aws autoscaling update-auto-scaling-group --auto-scaling-group-name <stack>-guardrails-asg --desired-capacity <N>` |
-| Get stack outputs | `aws cloudformation describe-stacks --stack-name <stack> --query "Stacks[0].Outputs[*].[OutputKey,OutputValue]" --output table` |
-| Delete stack | `aws cloudformation delete-stack --stack-name <stack> --region <region>` |
+```bash
+# --- AI Gateway (AIG) ---
+
+# AIG instance states
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names $STACK-aig-asg \
+  --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" \
+  --output table --region $REGION
+
+# AIG enrollment / Activation Lambda logs (look for "Registered appliance")
+aws logs tail /aws/lambda/$STACK-aig-activation --since 30m --region $REGION
+
+# AIG target health
+aws elbv2 describe-target-health --region $REGION --output table \
+  --target-group-arn $(aws elbv2 describe-target-groups --region $REGION \
+    --query "TargetGroups[?contains(TargetGroupName,'$STACK-aig')].TargetGroupArn" --output text)
+
+# Scale AIG
+aws autoscaling update-auto-scaling-group --auto-scaling-group-name $STACK-aig-asg \
+  --desired-capacity <N> --region $REGION
+
+# --- DLP On Demand (DLPoD) ---
+
+# DLPoD instance states
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names $STACK-dlpod-asg \
+  --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" \
+  --output table --region $REGION
+
+# DLPoD bootstrap builder logs
+aws logs tail /aws/lambda/$STACK-dlpod-bootstrap-builder --since 30m --region $REGION
+
+# DLPoD readiness gate logs (stack create only)
+aws logs tail /aws/lambda/$STACK-dlpod-readiness --since 30m --region $REGION
+
+# DLPoD target health
+aws elbv2 describe-target-health --region $REGION --output table \
+  --target-group-arn $(aws elbv2 describe-target-groups --region $REGION \
+    --query "TargetGroups[?contains(TargetGroupName,'$STACK-dlpod')].TargetGroupArn" --output text)
+
+# Scale DLPoD
+aws autoscaling update-auto-scaling-group --auto-scaling-group-name $STACK-dlpod-asg \
+  --desired-capacity <N> --region $REGION
+
+# --- AI Guardrails (only if deployed) ---
+
+# Guardrails target health
+aws elbv2 describe-target-health --region $REGION --output table \
+  --target-group-arn $(aws elbv2 describe-target-groups --region $REGION \
+    --query "TargetGroups[?contains(TargetGroupName,'$STACK-guardrails')].TargetGroupArn" --output text)
+
+# Guardrails readiness gate: a CloudFormation WaitCondition signalled from the first
+# instance's UserData. Check stack events for GuardrailsReadinessGate, or inspect
+# the instance directly:
+aws ssm start-session --target <instance-id> --region $REGION
+#   then: sudo docker logs guardrails ; cat /var/log/user-data.log
+
+# Scale Guardrails
+aws autoscaling update-auto-scaling-group --auto-scaling-group-name $STACK-guardrails-asg \
+  --desired-capacity <N> --region $REGION
+
+# --- Stack ---
+
+# Stack outputs
+aws cloudformation describe-stacks --stack-name $STACK --region $REGION \
+  --query "Stacks[0].Outputs[*].[OutputKey,OutputValue]" --output table
+
+# Delete stack
+aws cloudformation delete-stack --stack-name $STACK --region $REGION
+```
 
 ---
 
@@ -150,8 +218,12 @@ Internet → AIG ALB (HTTPS:443, internet-facing)
 ```
 
 **AI Guardrails (optional):** set `GuardrailsImageS3Bucket` (S3 bucket holding `aisecurity-llm.tgz`) and `GuardrailsAmiId` (Deep Learning Base GPU AMI).
-The activation Lambda then adds `ai_guardrails.host` to the AIG bootstrap secret and AIG launch waits for the
-Guardrails ALB targets to be healthy. Leave `GuardrailsImageS3Bucket` empty to skip the tier.
+The Activation Lambda then adds `ai_guardrails.host` to the AIG bootstrap secret. AIG launch is held by
+`GuardrailsReadinessGate`, an `AWS::CloudFormation::WaitCondition` (60-minute timeout) that the first
+Guardrails instance signals from its UserData once the local container answers `/ping` with 200 (UserData
+gives up after 15 minutes and signals FAILURE). Guardrails instances place the image tarball and Docker
+data-root on local NVMe instance storage, which is why `GuardrailsInstanceType` is limited to g4dn/g5 types.
+Leave `GuardrailsImageS3Bucket` empty to skip the tier.
 
 **Lifecycle automation (AIG):** ASG launch hook → SNS → Activation Lambda → registers appliance
 with Netskope API → writes enrollment token to Secrets Manager → `CompleteLifecycleAction` → InService.
@@ -186,3 +258,8 @@ read only the bootstrap secret. Instance IAM roles have no access to the API cre
   51 KB direct-upload limit. Run `scripts/deploy-artifacts.sh <region>` to create the S3 bucket.
 - **All Lambda functions use inline `ZipFile` code** — no S3 Lambda artifacts are required.
 - **AMI defaults are us-west-1 only** — override `GatewayAmiId` and `DlpodAmiId` for other regions.
+- **No ASG has an `UpdatePolicy`** — changing an AMI ID updates the launch template only; run
+  `aws autoscaling start-instance-refresh` manually to roll instances.
+- **Guardrails instance types must have local NVMe instance storage** — do not add EBS-only types
+  to `GuardrailsInstanceType` AllowedValues, and do not remove the NVMe mount / Docker data-root
+  logic from the Guardrails UserData. Boot on NVMe was measured much faster than on EBS.

@@ -5,7 +5,7 @@ Development instructions for Claude Code when modifying code or templates in thi
 ## Template
 
 This repository contains a single production template: `templates/gateway-combined.yaml`.
-It deploys AIG + DLP On Demand + optional AI Guardrails in one stack.
+It deploys AI Gateway (AIG) + DLP On Demand (DLPoD) + optional AI Guardrails in one stack.
 
 > **Standalone templates** (AIG-only, DLPoD-only) are in [AWS-POV-Templates-CFT](https://github.com/jharris-ns/AWS-POV-Templates-CFT).
 
@@ -16,8 +16,8 @@ templates/
   gateway-combined.yaml       # Combined AIG + DLPoD + optional Guardrails
 
 docs/
-  DEPLOYMENT.md               # Combined template deployment guide
-  OPERATIONS.md               # Combined template operations reference
+  DEPLOYMENT.md               # Deployment guide
+  OPERATIONS.md               # Operations reference
   ARCHITECTURE.md             # Architecture narrative
   QUICKSTART.md               # Condensed quick-start reference
   SECURITY.md                 # Secret handling, IAM, network security
@@ -25,26 +25,26 @@ docs/
 
 scripts/
   deploy-artifacts.sh         # Creates S3 bucket for template upload
-
-dist/
-  (empty — no packaged Lambda artifacts; all Lambdas are inline)
 ```
+
+There is no `dist/` directory and no Lambda packaging step — all Lambdas are inline.
 
 ## Lifecycle Flows
 
-### AIG (combined template)
+### AIG
 
 The AIG lifecycle uses an inline Activation Lambda — no Step Functions, no SSH:
 
 1. ASG launches instance → lifecycle hook holds it in `Pending:Wait`
-2. SNS delivers event to `ActivationLambdaFunction` (inline)
+2. SNS delivers event to `AigActivationLambdaFunction` (inline)
 3. Lambda registers appliance with Netskope API → receives enrollment token
-4. Lambda writes bootstrap secret with `enrollment_token` (+ DLP cert and host in combined)
+4. Lambda writes bootstrap secret with `enrollment_token` plus the DLPoD cert and host
+   (and `ai_guardrails.host` when Guardrails is deployed)
 5. Lambda calls `CompleteLifecycleAction(CONTINUE)` → instance moves to `InService`
 6. Instance reads bootstrap secret on first boot → self-enrolls using aig-cli
 7. On termination: Lambda deregisters appliance, deletes SSM parameter
 
-### DLPoD (combined template)
+### DLPoD
 
 DLPoD uses nsbootstrap.service with EC2 UserData — no SSH, no Step Functions, no paramiko:
 
@@ -57,7 +57,7 @@ DLPoD uses nsbootstrap.service with EC2 UserData — no SSH, no Step Functions, 
 
 ## Key Resources
 
-### Combined template (`templates/gateway-combined.yaml`)
+Full inventory is in `templates/gateway-combined.yaml`; the resources most often touched:
 
 | Resource | Type | Purpose |
 |----------|------|---------|
@@ -74,12 +74,13 @@ DLPoD uses nsbootstrap.service with EC2 UserData — no SSH, no Step Functions, 
 | `DlpodAlbCertificate` | Custom::AlbCertificate | Self-signed cert for DLPoD ALB |
 | `DlpodCredentialsSecret` | SecretsManager::Secret | DLPoD license key |
 | `DlpodPrivateHostedZone` | Route53::HostedZone | Private zone `aigw.internal` (DLPoD + Guardrails records) |
-| `DlpodReadinessGateFunction` | Lambda::Function | Target-group readiness poller (inline, shared by both gates) |
+| `DlpodReadinessGateFunction` | Lambda::Function | Target-group readiness poller (inline; DLPoD gate only, 840 s budget) |
 | `DlpodReadinessGate` | Custom::DlpodReadiness | Blocks AIG launch until DLPoD targets healthy |
-| `GuardrailsAutoScalingGroup` | AutoScaling::AutoScalingGroup | *(Condition: DeployGuardrails)* GPU instances running `aisecurityllm` |
-| `GuardrailsLaunchTemplate` | EC2::LaunchTemplate | *(conditional)* DL Base GPU AMI; UserData does `aws s3 cp` + `docker load` + `docker run` |
+| `GuardrailsAutoScalingGroup` | AutoScaling::AutoScalingGroup | *(Condition: DeployGuardrails)* GPU instances running `aisecurityllm`; `HealthCheckType: EC2` |
+| `GuardrailsLaunchTemplate` | EC2::LaunchTemplate | *(conditional)* DL Base GPU AMI; UserData mounts local NVMe, does `aws s3 cp` + `docker load` + `docker run` with Docker data-root on NVMe, then polls `/ping` |
 | `GuardrailsAlb` | ELBv2::LoadBalancer | *(conditional)* Internal HTTP ALB at `guardrails.aigw.internal` |
-| `GuardrailsReadinessGate` | Custom::DlpodReadiness | *(conditional)* Blocks AIG launch until Guardrails targets healthy |
+| `GuardrailsWaitHandle` | CloudFormation::WaitConditionHandle | *(conditional)* Pre-signed URL passed into Guardrails UserData |
+| `GuardrailsReadinessGate` | CloudFormation::WaitCondition | *(conditional)* Blocks AIG launch until the first Guardrails instance signals SUCCESS from UserData (`Timeout: 3600`, `Count: 1`; UserData signals FAILURE after 15 min) |
 
 ## Template Conventions
 
@@ -87,8 +88,11 @@ DLPoD uses nsbootstrap.service with EC2 UserData — no SSH, no Step Functions, 
 - All named resources use `!Sub '${AWS::StackName}-<role>'`
 - No tag parameters — `Project`, `Environment`, and `ManagedBy` are passed as stack-level `--tags`
 - IAM follows least-privilege — separate statements per permission grant, no `Resource: '*'`
-  except where required (DescribeInstances, VPC networking)
-- Sensitive values in Secrets Manager; gateway instances have no Secrets Manager access
+  except where the API requires it: `ec2:DescribeInstances` (Activation Lambda),
+  `acm:ImportCertificate` / `DeleteCertificate` / `AddTagsToCertificate` (cert generator),
+  and `elasticloadbalancing:DescribeTargetHealth` (readiness gate)
+- Sensitive values in Secrets Manager. `GatewayRole` may read only `AigBootstrapSecret`
+  (`ReadBootstrapSecret`); no instance role can read `NetskopeSecret` (the API credentials)
 - Lifecycle hooks must be **inline** on the ASG (`LifecycleHookSpecificationList`) — separate
   resources create a race condition where instances launch before hooks exist
 - All Lambda functions use inline `ZipFile` code — no S3 Lambda artifacts are required.
@@ -98,7 +102,8 @@ DLPoD uses nsbootstrap.service with EC2 UserData — no SSH, no Step Functions, 
 
 All Lambda functions are inline (`ZipFile`) — no packaged artifacts to build or upload.
 The only script is `scripts/deploy-artifacts.sh`, which creates the S3 bucket used for
-template upload (required because the combined template, ~68 KB, exceeds 51 KB).
+template upload (required because the template, ~71 KB, exceeds 51 KB). Override the bucket
+name with `TEMPLATE_BUCKET=<name>`.
 
 ## Development Rules
 
@@ -118,10 +123,19 @@ template upload (required because the combined template, ~68 KB, exceeds 51 KB).
 - **Do not store API credentials on instances** — Activation Lambda handles all Netskope API
   calls. Enrollment token is passed via bootstrap secret and never persisted elsewhere.
 - **Cert must have `CA:TRUE` basicConstraints** for the AIG DLP service to accept it.
-- **Sensitive fields are redacted in Lambda logs** — `password`, `enrollment_token`, and
-  `license_key` values must be masked before logging.
+- **Lambdas must never log secret values** — there is no masking layer; the functions simply
+  do not print `api_token`, `enrollment_token`, `license_key`, or TLS private keys. Keep it
+  that way when adding log lines.
 - **Template size**: the template (~71 KB) exceeds 51 KB → must be deployed via
   `--template-url` referencing S3.
+- **No `UpdatePolicy` on any ASG** — an AMI or launch-template change does not replace
+  instances; operators run `aws autoscaling start-instance-refresh` manually. Do not document
+  automatic instance refresh unless an `UpdatePolicy` is added.
+- **Guardrails instance types must have local NVMe instance storage** — UserData places the
+  image tarball and Docker data-root on the instance store (falling back to `/tmp` on the gp3
+  root, which is much slower and risks the 15-minute UserData budget). Do not add EBS-only
+  types to `GuardrailsInstanceType` AllowedValues, and do not remove the NVMe mount /
+  Docker data-root logic from Guardrails UserData.
 - **Guardrails is optional and conditional** — every Guardrails resource carries
   `Condition: DeployGuardrails`. `DependsOn` cannot target a conditional resource (cfn-lint
   E3005), so `GatewayAutoScalingGroup` depends on `GuardrailsReadinessGate` via a

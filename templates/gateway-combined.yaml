@@ -147,8 +147,10 @@ Parameters:
     Type: AWS::EC2::Image::Id
     Default: ami-0973780ab75c2fb28
     Description: >
-      DLPoD appliance AMI. Default is DLP On Demand in us-west-1.
-      Override for other regions. Obtain AMI IDs from Netskope support.
+      DLPoD appliance AMI. Default is DLP On Demand in us-west-1 and launches only if that
+      image has been shared to this account. The AMI is not on AWS Marketplace: share it from
+      the Netskope console (Security Cloud Platform > On-Premises Infrastructure > Setup DLP
+      On Demand > AWS > Share Image), then find it under EC2 > AMIs > Private images.
 
   DlpodInstanceType:
     Type: String
@@ -182,7 +184,9 @@ Parameters:
     Type: String
     Default: g4dn.xlarge
     AllowedValues: [g4dn.xlarge, g4dn.2xlarge, g5.xlarge, g5.2xlarge]
-    Description: GPU instance type for Guardrails. Requires "Running On-Demand G and VT instances" quota.
+    Description: >
+      GPU instance type for Guardrails. Requires "Running On-Demand G and VT instances" quota.
+      Must have local NVMe instance storage (g4dn/g5); the image and Docker storage are placed on it.
 
   GuardrailsDesiredCapacity:
     Type: Number

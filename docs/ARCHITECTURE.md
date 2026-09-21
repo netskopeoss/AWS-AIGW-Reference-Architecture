@@ -1,13 +1,21 @@
 # Architecture Overview — AI Gateway + DLP On Demand
 
-AWS reference architecture for deploying Netskope AI Gateway and DLP On Demand together using
-CloudFormation. This document explains each design decision through the lens of AWS best practices
-and the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
+AWS reference architecture for deploying Netskope AI Gateway (AIG) and DLP On Demand (DLPoD)
+together using CloudFormation. This document explains each design decision through the lens of
+AWS best practices and the
+[AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
 ## Table of Contents
 
 - [Architecture Diagram](#architecture-diagram)
 - [Component Overview](#component-overview)
+  - [VPC and Subnet Design](#vpc-and-subnet-design)
+  - [AI Gateway (AIG) — Internet-Facing Tier](#ai-gateway-aig--internet-facing-tier)
+  - [DLP On Demand (DLPoD) — Internal Inspection Tier](#dlp-on-demand-dlpod--internal-inspection-tier)
+  - [AI Guardrails (Optional) — GPU Inference Tier](#ai-guardrails-optional--gpu-inference-tier)
+  - [Instance Sizing and Throughput](#instance-sizing-and-throughput)
+  - [Certificate Management](#certificate-management)
+  - [IAM Design](#iam-design)
 - [Traffic Flows](#traffic-flows)
 - [Security Design](#security-design)
 - [High Availability Design](#high-availability-design)
@@ -86,36 +94,137 @@ NAT Gateway. The stack's Lambda functions are not VPC-attached and do not use th
 | Deployment | Auto Scaling Group across private AZ1 + AZ2 |
 | ALB | Internet-facing, public subnets AZ1 + AZ2, HTTPS port 443 |
 | Default capacity | Min 1, Max 4 |
-| Auto-scale trigger | Average CPU ≥ 70% for two consecutive 5-minute periods |
+| Health check | ELB (HTTPS `GET /` on 443, 200–499 accepted, every 10 s), 600 s grace period |
+| Auto-scale trigger | Average CPU > `ScaleOutCpuThreshold` (default 70 %) for two consecutive 5-minute periods (`GreaterThanThreshold`) — scale-out only |
 | Enrollment | Reads bootstrap secret from Secrets Manager at boot; self-enrolls autonomously |
 
-The AI Gateway presents an OpenAI-compatible HTTPS API to clients. Every request and response
-passes through the gateway's inline inspection — DLP, prompt injection detection, access control,
-rate limiting, and audit logging — before reaching the upstream LLM provider.
+The AIG presents an OpenAI-compatible HTTPS API to clients. Every request and response passes
+through the gateway's inline inspection — DLP, prompt injection detection, access control, rate
+limiting, and audit logging — before reaching the upstream LLM provider.
 
 ### DLP On Demand (DLPoD) — Internal Inspection Tier
 
 | Attribute | Value |
 |---|---|
-| Instance type (default) | `c5a.4xlarge` (16 vCPU / 32 GB RAM) |
-| AMI | Netskope DLP On Demand (AWS Marketplace) |
+| Instance type (default) | `c5a.4xlarge` (16 vCPU / 32 GB RAM) — Netskope's "Small" (proof-of-concept) tier; see [Instance Sizing and Throughput](#instance-sizing-and-throughput) |
+| AMI | Netskope DLP On Demand (shared to your account from the Netskope console) |
+| Root volume | 351 GB gp3, `Encrypted: true` — matches Netskope's minimum disk requirement for the appliance |
 | Deployment | Auto Scaling Group across private AZ1 + AZ2 |
 | ALB | Internal, private subnets, HTTPS port 443 |
 | DNS | `dlp.aigw.internal` (Route 53 private hosted zone) |
 | Default capacity | Min 1, Max 4 |
-| Health check | ELB (HTTPS `GET /` on 443, 200–499 accepted), 1800 s grace period |
-| Bootstrap | `bootstrap.json` delivered via EC2 UserData; applied by the appliance's `nsbootstrap.service` at first boot (~5–10 minutes to healthy) |
+| Health check | ELB (HTTPS `GET /` on 443, 200–499 accepted, every 30 s), 1800 s grace period |
+| Bootstrap | `bootstrap.json` delivered via EC2 UserData; applied by the appliance's `nsbootstrap.service` at first boot |
 
-DLP On Demand receives content from the AI Gateway over HTTPS, applies DLP policies locally
-inside the VPC, and returns a verdict. Content never leaves your AWS account for DLP processing.
+DLPoD receives content from the AIG over HTTPS, applies DLP policies locally inside the VPC, and
+returns a verdict. Content never leaves your AWS account for DLP processing.
 
 There is no lifecycle hook, SNS topic, or per-instance Lambda on the DLPoD tier. The launch
 template UserData already contains everything the appliance needs (TLS server cert + key, license
 key, DNS resolver `169.254.169.253`, `dlp-on-demand` persona), so scale-outs and replacements
 need no orchestration.
 
+**Time to ready.** The ALB health check only tests that the appliance answers on port 443, which
+typically happens 5–10 minutes after launch. Netskope's
+[DLP On Demand setup guide](https://docs.netskope.com/en/dlpondemandconfig) states that the
+appliance needs roughly 30 minutes after tethering to fully initialise (download DLP profiles and
+report ready). The ALB health check therefore passes before the appliance is fully operational;
+confirm DLP-profile readiness in the Netskope console (Security Cloud Platform > On-Premises
+Infrastructure) before relying on inspection results.
+
+**Egress requirements.** DLPoD egress goes through the NAT Gateway with an open outbound
+security-group rule. If you add egress filtering (a firewall, proxy, or restrictive NACL), the
+appliance must still be able to reach, per the Netskope setup guide:
+
+- the Netskope IP ranges for your tenant
+- Amazon S3 (`*.s3-us-west-1.amazonaws.com` is listed by Netskope; the stack's S3 Gateway
+  Endpoint covers in-region S3 traffic)
+- `config-<tenant>.goskope.com`
+- `callhome-<tenant>.goskope.com`
+- the `dlpappliancegw.*.goskope.com` set
+
+Netskope advises against TLS interception of this management-plane traffic — pass it through
+any inspecting proxy unmodified.
+
 > *Well-Architected [SEC09-BP02](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/sec_protect_data_transit.html):
 > Enforce encryption in transit and keep sensitive data within your network boundary.*
+
+### AI Guardrails (Optional) — GPU Inference Tier
+
+Deployed only when `GuardrailsImageS3Bucket` is set (the `DeployGuardrails` condition).
+
+| Attribute | Value |
+|---|---|
+| Instance type (default) | `g4dn.xlarge` (4 vCPU / 16 GB RAM / NVIDIA T4); `AllowedValues` limited to `g4dn.xlarge`, `g4dn.2xlarge`, `g5.xlarge`, `g5.2xlarge` |
+| AMI | AWS Deep Learning Base GPU AMI (`GuardrailsAmiId`) — NVIDIA driver preinstalled |
+| Root volume | 100 GB gp3, `Encrypted: true` |
+| Deployment | Auto Scaling Group across private AZ1 + AZ2, Min 1, Max 4 |
+| ALB | Internal, private subnets, HTTP on `GuardrailsContainerPort` (default 8080), `guardrails.aigw.internal` |
+| Health check | ALB: HTTP `GET /ping` expecting 200, every 30 s. ASG: `HealthCheckType: EC2` (no ALB-driven replacement, no grace period) |
+| Container | `aisecurityllm` image loaded from the `aisecurity-llm.tgz` tarball in S3; `docker run --gpus all`, `--restart=unless-stopped` |
+| Readiness gate | `GuardrailsReadinessGate` (`AWS::CloudFormation::WaitCondition`, `Count: 1`, `Timeout: 3600`) |
+
+The AIG reaches this tier via the `ai_guardrails.host` entry
+(`http://guardrails.aigw.internal:8080/invocations`) that the Activation Lambda writes into the
+AIG bootstrap secret at every AIG launch.
+
+**Why the instance type is restricted to NVMe-equipped types.** Every allowed type ships a local
+NVMe instance store. The launch template UserData mounts it (the Deep Learning AMI auto-mounts it
+at `/opt/dlami/nvme`; otherwise UserData finds the `NVMe Instance Storage` device with `lsblk`,
+formats it ext4, and mounts it), downloads `aisecurity-llm.tgz` onto it, and moves Docker's
+`data-root` onto it before `docker load`. Testing showed this boots much faster than running the
+multi-GB image load on the EBS root volume. If no instance-store device is present, UserData falls
+back to `/tmp` on the 100 GB gp3 root — a much slower path that risks exceeding the 15-minute
+container-health budget in UserData. Because the instance store is ephemeral, every launch
+re-downloads the tarball from S3 and re-loads the image; S3 bucket region (the bucket must be in
+the stack's region) and instance-store presence together determine boot time. Do not widen
+`GuardrailsInstanceType` to EBS-only types without re-testing.
+
+**Readiness gate.** Unlike the DLPoD tier, the Guardrails gate does not use the readiness Lambda.
+`GatewayAutoScalingGroup` depends on `GuardrailsReadinessGate`, a CloudFormation WaitCondition
+that is satisfied by a cfn-signal-style `curl` from the Guardrails instance UserData once the
+local `/ping` returns 200. UserData polls 90 times at 10-second intervals (15 minutes) and then
+signals `FAILURE`, which fails the WaitCondition and rolls the stack back. The WaitCondition's own
+timeout is 3600 s; with `Count: 1` the first successful signal releases the AIG ASG. Nothing is
+written to `/aws/lambda/<stack>-dlpod-readiness` for this gate — look at
+`describe-stack-events` and `/var/log/user-data.log` on the instance instead.
+
+The Guardrails tier is the only tier reachable for diagnostics (SSM Session Manager via
+`AmazonSSMManagedInstanceCore`); AIG and DLPoD instances have no interactive access path.
+
+### Instance Sizing and Throughput
+
+| Service | Instance type | vCPU | Memory | Instance store | Notes |
+|---|---|---|---|---|---|
+| AI Gateway | `m5.4xlarge` (default) | 16 | 64 GB | — | Standard DLP + guardrails (CPU-based) |
+| AI Gateway | `m6i.4xlarge` | 16 | 64 GB | — | Alternative; newer generation |
+| AI Gateway | `c5.4xlarge` | 16 | 32 GB | — | Compute-optimized; lower memory |
+| AI Guardrails (optional) | `g4dn.xlarge` (default) | 4 | 16 GB | 125 GB NVMe | NVIDIA T4; `aisecurityllm` container tier |
+| AI Guardrails (optional) | `g4dn.2xlarge` | 8 | 32 GB | 225 GB NVMe | NVIDIA T4 |
+| AI Guardrails (optional) | `g5.xlarge` | 4 | 16 GB | 250 GB NVMe | NVIDIA A10G |
+| AI Guardrails (optional) | `g5.2xlarge` | 8 | 32 GB | 450 GB NVMe | NVIDIA A10G |
+| DLP On Demand | `c5a.4xlarge` (default) | 16 | 32 GB | — | Netskope "Small" tier — proof-of-concept only |
+| DLP On Demand | `c5ad.4xlarge` | 16 | 32 GB | 2 × 300 GB NVMe | Netskope "Small" tier — proof-of-concept only |
+| DLP On Demand | `c5a.8xlarge` | 32 | 64 GB | — | Netskope "Medium" tier (production) — use where `c5ad` is unavailable |
+| DLP On Demand | `c5ad.8xlarge` | 32 | 64 GB | 2 × 600 GB NVMe | Netskope "Medium" tier (production, recommended) |
+| DLP On Demand | `c5a.16xlarge` | 64 | 128 GB | — | Netskope "Large" tier (production) — use where `c5ad` is unavailable |
+| DLP On Demand | `c5ad.16xlarge` | 64 | 128 GB | 2 × 1200 GB NVMe | Netskope "Large" tier (production, recommended) |
+
+**Instance store:** Guardrails types are restricted to those with local NVMe because the image
+tarball and Docker storage are placed there (see the
+[Guardrails section](#ai-guardrails-optional--gpu-inference-tier)). For DLPoD, the `c5ad`
+family is what Netskope lists; the `c5a` equivalents are the documented fallback where `c5ad` is
+not offered in a region. All six DLPoD types are in the template's `AllowedValues`.
+
+**DLPoD tiers:** per the
+[Netskope DLP On Demand setup guide](https://docs.netskope.com/en/dlpondemandconfig), the
+`4xlarge` size is intended only for proof-of-concept testing; Netskope recommends Medium
+(`8xlarge`) or Large (`16xlarge`) for production. The template default `c5a.4xlarge` is therefore
+a POC default — set `DlpodInstanceType` for production. The 351 GB gp3 root volume in the template
+matches Netskope's minimum disk requirement for every tier.
+
+See [AI Gateway Sizing Guidelines](https://docs.netskope.com/en/ai-gateway-sizing-guidelines/)
+for request throughput guidance per AIG instance type.
 
 ### Certificate Management
 
@@ -134,7 +243,7 @@ key to `<stack>-dlpod-cert-key`. Two consumers pick this up:
 - `DlpodBootstrapBuilderFunction` (`<stack>-dlpod-bootstrap-builder`) reads the cert-key secret and
   the license key and assembles the DLPoD `bootstrap.json` UserData — so every DLPoD instance
   serves the same leaf cert on 443.
-- The AIG Activation Lambda reads the CA PEM from `/<stack>/dlpod-cert` at every AIG launch and
+- The Activation Lambda reads the CA PEM from `/<stack>/dlpod-cert` at every AIG launch and
   writes it into the bootstrap secret as `dlp.certificate` — so the first AIG instance that starts
   already trusts the DLPoD endpoint.
 
@@ -147,24 +256,17 @@ The same function generates the AIG ALB cert when `AcmCertificateArn` is left em
 
 ### IAM Design
 
-Seven IAM roles (eight with the optional Guardrails tier) enforce least privilege. No role has
-more access than its specific function requires.
+Seven IAM roles (eight with the optional Guardrails tier) enforce least privilege: each Lambda
+function, each instance tier, and the Auto Scaling SNS publisher has its own role, scoped to the
+specific secret, parameter, log group, and ASG ARNs it needs. The only `Resource: "*"` grants are
+on actions that cannot be ARN-scoped (`ec2:DescribeInstances`,
+`elasticloadbalancing:DescribeTargetHealth`, ACM import). AIG instances never hold Netskope API
+credentials — the Activation Lambda exchanges the API token for an enrollment token in memory and
+writes only that to the bootstrap secret — and DLPoD instances have no Secrets Manager or SSM
+access at all.
 
-| Role | Assumed by | Purpose |
-|---|---|---|
-| `<stack>-gateway-role` | `ec2.amazonaws.com` | Read `<stack>-aig-bootstrap` at boot; CloudWatch Agent. No access to API credentials. |
-| `<stack>-aig-activation-role` | `lambda.amazonaws.com` | Call Netskope API to register/deregister AIG; write enrollment token + DLP (and Guardrails) block to bootstrap secret; read DLPoD CA cert from SSM; track appliance IDs in `/aig/<stack>/*`; complete lifecycle hooks on `<stack>-aig-asg`. |
-| `<stack>-aig-lifecycle-sns-role` | `autoscaling.amazonaws.com` | Publish AIG Auto Scaling lifecycle events to SNS. |
-| `<stack>-dlpod-role` | `ec2.amazonaws.com` | CloudWatch Agent only. No secrets or SSM access. |
-| `<stack>-dlpod-bootstrap-builder-role` | `lambda.amazonaws.com` | Read `<stack>-dlpod-cert-key` and `<stack>-dlpod-credentials` to assemble `bootstrap.json` UserData (stack create/update only). |
-| `<stack>-dlpod-readiness-role` | `lambda.amazonaws.com` | `elasticloadbalancing:DescribeTargetHealth` — readiness gate that blocks AIG launch until DLPoD (and Guardrails) targets are healthy. |
-| `<stack>-certgen-role` | `lambda.amazonaws.com` | Generate cert hierarchy; import leaf to ACM; write PEMs to SSM `/<stack>/*`; write `<stack>-dlpod-cert-key`. |
-| `<stack>-guardrails-role` *(Guardrails only)* | `ec2.amazonaws.com` | `s3:GetObject` on the `aisecurity-llm.tgz` image tarball; SSM Session Manager; CloudWatch Agent. |
-
-**Key principle:** AIG instances never hold Netskope API credentials. The Activation Lambda reads
-the API token from Secrets Manager, calls the Netskope API, and receives an enrollment token in
-memory — which it writes to the bootstrap secret. The AIG instance reads only the bootstrap
-secret (enrollment token + DLP endpoint), not the raw API token.
+The complete role inventory and per-role permission detail is maintained in
+[SECURITY.md — IAM Roles and Permissions](SECURITY.md#iam-roles-and-permissions).
 
 > *Well-Architected [SEC03-BP01](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/sec_permissions_define.html):
 > Define access requirements and enforce least privilege.*
@@ -190,7 +292,7 @@ secret (enrollment token + DLP endpoint), not the raw API token.
 
 ```
 1. ASG launches AIG instance → lifecycle hook holds it in Pending:Wait (120s)
-2. SNS delivers lifecycle event → AIG Activation Lambda (<stack>-aig-activation)
+2. SNS delivers lifecycle event → Activation Lambda (<stack>-aig-activation)
 3. Activation Lambda:
    a. Reads API token from <stack>-netskope-credentials (Secrets Manager)
    b. Calls Netskope REST API → registers appliance → receives enrollment token
@@ -230,17 +332,16 @@ Instance launch
    sets the dlp-on-demand persona; appliance connects outbound to the Netskope
    management plane via the NAT Gateway
 3. DLPoD listens on HTTPS:443 → ALB health check (GET /, 200–499, 2 passes at 30 s) → healthy
-   (typically 5–10 minutes after launch)
+   (typically 5–10 minutes after launch; full DLP-profile initialisation takes longer —
+   see the DLPoD tier section)
 ```
 
-**Readiness gate (stack creation only):** `GatewayAutoScalingGroup` has
-`DependsOn: DlpodReadinessGate`, a custom resource backed by the inline Lambda
-`<stack>-dlpod-readiness` that polls `describe-target-health` on the DLPoD target group every
-30 s. It succeeds when all targets are healthy and fails (rolling the stack back) if that has not
-happened within 14 minutes. AIG validates the DLPoD HTTPS endpoint during enrollment, so this
-guarantees DLPoD is serving before the first AIG instance boots. When Guardrails is deployed, a
-second gate (`GuardrailsReadinessGate`, same Lambda) does the same for the Guardrails target group.
-The gate is a no-op on stack update/delete and does not apply to later scale-outs.
+**Readiness gates (stack creation only):** `GatewayAutoScalingGroup` depends on
+`DlpodReadinessGate` — a custom resource whose inline Lambda polls the DLPoD target group until
+every target is healthy (840 s limit) — and, when Guardrails is deployed, on
+`GuardrailsReadinessGate`, a CloudFormation WaitCondition signalled from the Guardrails instance
+UserData. Both are described in full in
+[OPERATIONS.md — Startup Sequence](OPERATIONS.md#startup-sequence).
 
 ### 4. DLP inspection (runtime, per request)
 
@@ -255,12 +356,15 @@ The gate is a no-op on stack update/delete and does not apply to later scale-out
 ### 5. AIG scale-out (runtime, automatic)
 
 ```
-1. CloudWatch alarm: AIG ASG average CPU ≥ 70% for two 5-minute periods
+1. CloudWatch alarm: AIG ASG average CPU > 70% (GreaterThanThreshold) for two 5-minute periods
 2. Step scaling policy adds one AIG instance
 3. New instance → Pending:Wait → Activation Lambda (same flow as #2)
 4. New instance: InService → ALB healthy → serving requests
    (enrollment typically completes in 5–15 minutes)
 ```
+
+There is no scale-in policy. Reducing capacity is a manual operation — see
+[OPERATIONS.md — Scaling](OPERATIONS.md#scaling).
 
 ---
 
@@ -285,19 +389,22 @@ root volume.
 
 ### Secrets and Credentials
 
-| Secret | Service | Contents | Who reads it | Lifecycle |
-|---|---|---|---|---|
-| `<stack>-netskope-credentials` | Secrets Manager | Netskope API token + tenant URL | AIG Activation Lambda only | Created at stack creation; deleted at teardown |
-| `<stack>-aig-bootstrap` | Secrets Manager | Enrollment token (per instance), DLP CA cert, DLP host, Guardrails host (optional) | AIG instances at boot; Activation Lambda writes | Created at stack creation; deleted at teardown |
-| `<stack>-dlpod-credentials` | Secrets Manager | DLP On Demand license key | DLPoD bootstrap builder Lambda only (stack create/update) | Created at stack creation; deleted at teardown |
-| `<stack>-dlpod-cert-key` | Secrets Manager | DLPoD CA cert, leaf cert, leaf private key (PEM) | DLPoD bootstrap builder Lambda only; cert generator writes | Created at stack creation; deleted at teardown |
-| `/<stack>/dlpod-cert` | SSM Parameter Store | DLPoD CA cert PEM (365-day validity) | AIG Activation Lambda at every AIG launch | Written by cert generator custom resource |
-| `/<stack>/aig-cert` | SSM Parameter Store | AIG ALB self-signed cert PEM (only when `AcmCertificateArn` is empty) | Operators, to distribute to clients | Written by cert generator custom resource |
-| `/aig/<stack>/<instance-id>` | SSM Parameter Store | AIG appliance ID in Netskope tenant | AIG Activation Lambda (termination cleanup) | Written at launch; deleted at termination |
+The design separates the long-lived Netskope API token from the material that instances actually
+consume. The API token lives in `<stack>-netskope-credentials`, readable only by the Activation
+Lambda. At every AIG launch the Lambda exchanges it for a one-time enrollment token and writes
+that — together with the DLPoD CA certificate from SSM and the DLP / Guardrails host names — into
+the separate `<stack>-aig-bootstrap` secret, which is the only secret the AIG instance role can
+read. Compromise of the bootstrap secret does not expose the API token.
 
-DLPoD instances never read Secrets Manager or SSM. Their TLS key and license key are embedded in
-the launch template UserData (`bootstrap.json`), which is readable by principals with
-`ec2:DescribeLaunchTemplateVersions` — see [SECURITY.md](SECURITY.md#known-limitations-and-accepted-risks).
+DLPoD instances never read Secrets Manager or SSM. Their TLS key and license key are assembled
+once, at stack create/update, by the bootstrap builder Lambda (which reads `<stack>-dlpod-cert-key`
+and `<stack>-dlpod-credentials`) and embedded in the launch template UserData (`bootstrap.json`).
+That UserData is readable by principals with `ec2:DescribeLaunchTemplateVersions` — see
+[SECURITY.md — Known Limitations](SECURITY.md#known-limitations-and-accepted-risks).
+
+The full inventory of the four secrets and three SSM parameter paths — contents, writer, reader,
+lifecycle — is maintained in
+[SECURITY.md — What's Stored and Where](SECURITY.md#whats-stored-and-where).
 
 ---
 
@@ -328,40 +435,27 @@ AZ1                              AZ2
 | Scenario | Impact | Recovery |
 |---|---|---|
 | Single AIG instance failure | Reduced capacity; remaining instances continue | ASG replaces automatically; new instance re-enrolls (~5–15 min) |
-| Single DLPoD instance failure | Reduced DLP capacity; ALB routes to healthy instances | ASG replaces; new instance self-configures from UserData via `nsbootstrap` (~5–10 min) |
+| Single DLPoD instance failure | Reduced DLP capacity; ALB routes to healthy instances | ASG replaces; new instance self-configures from UserData via `nsbootstrap` (~5–10 min to ALB-healthy) |
+| Single Guardrails instance failure *(optional tier)* | AIG guardrails calls fail until a healthy target exists | ASG replaces only on EC2 status-check failure (`HealthCheckType: EC2`); a running instance whose container is unhealthy is **not** replaced automatically — see [OPERATIONS.md — AI Guardrails](OPERATIONS.md#ai-guardrails-only-when-guardrailsimages3bucket-was-set) |
 | AZ failure (AIG) | Reduced capacity; other AZ continues | No action required; ASG may launch replacement in healthy AZ |
 | AZ failure (DLPoD) | Reduced DLP capacity | Same as above |
 | NAT Gateway failure | Instances lose outbound internet; DLP traffic unaffected (internal) | AWS SLA 99.99%; auto-recovers |
 | AIG enrollment failure | Instance ABANDONED by the launch hook; replacement launches automatically | Check Activation Lambda logs; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
 | DLPoD bootstrap failure | Target never healthy; ASG marks the instance unhealthy after the 30-min grace period and replaces it (no lifecycle hook, so no ABANDON state) | Check DLPoD target health and `/aws/lambda/<stack>-dlpod-bootstrap-builder`; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#dlp-on-demand-issues) |
-| DLPoD not healthy within 14 min at stack creation | `DlpodReadinessGate` fails; stack rolls back before any AIG instance launches | Re-create with `--disable-rollback` to inspect; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
+| DLPoD not healthy within 840 s at stack creation | `DlpodReadinessGate` fails; stack rolls back before any AIG instance launches | Re-create with `--disable-rollback` to inspect; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
+| Guardrails container not healthy within 15 min at stack creation *(optional tier)* | UserData signals `FAILURE` to `GuardrailsReadinessGate`; stack rolls back | Re-create with `--disable-rollback`; read `/var/log/user-data.log` via SSM; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#ai-guardrails-issues) |
 
 **RPO:** Zero — both services are stateless. Configuration is stored in CloudFormation and
 Netskope's management plane.
 
 **RTO per component:**
+
 | Scope | RTO |
 |---|---|
 | Single AIG instance | 5–15 minutes (auto-replaced and re-enrolled) |
-| Single DLPoD instance | 5–10 minutes (auto-replaced; `nsbootstrap` applies UserData at first boot) |
+| Single DLPoD instance | 5–10 minutes to ALB-healthy (auto-replaced; `nsbootstrap` applies UserData at first boot) |
 | AZ failure | 0 seconds (healthy AZ continues immediately) |
 | Full stack recreate | 12–18 minutes to `CREATE_COMPLETE` (DLPoD ~5–10 min, then AIG ~5–15 min); longer with Guardrails |
-
-### Instance Sizing and Throughput
-
-| Service | Instance type | vCPU | Memory | Notes |
-|---|---|---|---|---|
-| AI Gateway | `m5.4xlarge` (default) | 16 | 64 GB | Standard DLP + guardrails (CPU-based) |
-| AI Gateway | `m6i.4xlarge` | 16 | 64 GB | Alternative; newer generation |
-| AI Gateway | `c5.4xlarge` | 16 | 32 GB | Compute-optimized; lower memory |
-| AI Guardrails (optional) | `g4dn.xlarge` (default) | 4 | 16 GB | `aisecurityllm` container tier (NVIDIA T4); `GuardrailsInstanceType` |
-| AI Guardrails (optional) | `g5.xlarge` | 4 | 16 GB | `aisecurityllm` container tier (NVIDIA A10G) |
-| DLP On Demand | `c5a.4xlarge` (default) | 16 | 32 GB | Baseline DLP throughput |
-| DLP On Demand | `c5a.8xlarge` | 32 | 64 GB | Higher throughput |
-| DLP On Demand | `c5a.16xlarge` | 64 | 128 GB | Maximum throughput |
-
-See [AI Gateway Sizing Guidelines](https://docs.netskope.com/en/ai-gateway-sizing-guidelines/)
-for request throughput guidance per instance type.
 
 ---
 
@@ -389,18 +483,16 @@ on-demand pricing. Costs vary by region and actual traffic volume.
 **Scaling impact:**
 - Each additional AIG instance (`m5.4xlarge`): +~$550/month
 - Each additional DLPoD instance (`c5a.4xlarge`): +~$445/month
+- Moving DLPoD to a production tier (`c5ad.8xlarge` / `c5ad.16xlarge`) roughly doubles / quadruples
+  the DLPoD EC2 line
 - Example higher-capacity deployment (4 AIG + 2 DLPoD): ~$3,200–$3,500/month
 
-**Advanced GPU guardrails (optional, `GuardrailsImageS3Bucket` set):**
+**AI Guardrails (optional, `GuardrailsImageS3Bucket` set):**
 - `g4dn.xlarge` per GPU instance: +~$380/month
 - `g5.xlarge` per GPU instance: +~$760/month
 - Guardrails internal ALB: +~$18–30/month
-- S3 storage for the `aisecurity-llm.tgz` tarball: ~$0.023/GB-month
-
-When enabled, the Guardrails tier adds an internal HTTP ALB (`guardrails.aigw.internal`, port 8080)
-in the private subnets and a GPU Auto Scaling Group (1–4 instances) running the container. AIG reaches
-it via the `ai_guardrails.host` entry in its bootstrap secret; the AIG ASG does not launch until the
-Guardrails ALB reports all targets healthy, mirroring the DLPoD readiness gate.
+- S3 storage for the `aisecurity-llm.tgz` tarball: ~$0.023/GB-month; each Guardrails launch
+  re-downloads it (in-region via the S3 Gateway Endpoint, so no NAT data-processing charge)
 
 > These are estimates for planning purposes. Use [AWS Pricing Calculator](https://calculator.aws/)
 > with your actual region, instance counts, and expected traffic volumes for a precise figure.
@@ -417,13 +509,13 @@ Guardrails ALB reports all targets healthy, mirroring the DLPoD readiness gate.
 | **Security** | No public IP on compute instances; no SSH | AIG and DLPoD instances in private subnets; inbound only through ALBs; no security group opens port 22 |
 | **Security** | Encryption in transit and at rest | All external traffic TLS; AIG→DLPoD HTTPS with a stack-generated CA/leaf; `Encrypted: true` on all EBS root volumes; IMDSv2 required |
 | **Security** | Sensitive parameters masked | `NetskopeApiToken` and `DlpodLicenseKey` are `NoEcho: true` |
-| **Reliability** | Multi-AZ deployment | Both ASGs and both ALBs span AZ1 + AZ2 |
-| **Reliability** | Auto-replacement on failure | ELB health checks on both ASGs (AIG also has a launch lifecycle hook); failed instances replaced automatically |
-| **Reliability** | Startup ordering enforced | `CertGeneratorFunction` and bootstrap builder run before instances launch; `DlpodReadinessGate` blocks the AIG ASG until DLPoD targets are healthy |
+| **Reliability** | Multi-AZ deployment | All ASGs and ALBs span AZ1 + AZ2 |
+| **Reliability** | Auto-replacement on failure | ELB health checks on the AIG and DLPoD ASGs (AIG also has a launch lifecycle hook); the Guardrails ASG uses EC2 status checks only |
+| **Reliability** | Startup ordering enforced | `CertGeneratorFunction` and bootstrap builder run before instances launch; `DlpodReadinessGate` (and `GuardrailsReadinessGate` WaitCondition) block the AIG ASG until the dependent tiers are serving |
 | **Reliability** | No manual enrollment steps | Activation Lambda handles AIG enrollment; DLPoD self-configures from `bootstrap.json` via `nsbootstrap.service` |
 | **Operational Excellence** | Infrastructure as code | Single CloudFormation template, all Lambda code inline (`ZipFile`); all resources version-controlled |
 | **Operational Excellence** | Lifecycle automation | ASG hook → SNS → Lambda handles every AIG lifecycle event; DLPoD needs none — its launch template UserData is complete |
-| **Cost Optimization** | Step scaling | Scale-out triggered by CPU threshold; scale in when load drops |
+| **Cost Optimization** | Step scaling (scale-out) | AIG scale-out triggered by the CPU alarm; scale-in is a manual operation (no scale-in policy is defined) |
 | **Cost Optimization** | S3 Gateway Endpoint | S3 traffic (Guardrails image download, template reads) stays on the AWS backbone — no NAT Gateway data-processing charges |
 
 > *References: [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html),

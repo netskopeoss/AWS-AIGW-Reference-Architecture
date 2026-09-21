@@ -1,15 +1,16 @@
 # Quick Start — AI Gateway + DLP On Demand
 
-Get both services deployed and traffic flowing in under 30 minutes. This guide is written for
-Netskope customers and sales engineers — AWS CLI experience helpful but not required. A console
-alternative is provided for deploy.
+Get Netskope AI Gateway (AIG) and DLP On Demand (DLPoD) deployed and traffic flowing in about
+30–45 minutes, including the Marketplace subscription, AMI sharing, and the 12–18 minute stack
+build. This guide is written for Netskope customers and sales engineers — AWS CLI experience is
+helpful but not required. A console alternative is provided for deploy.
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for the full parameter reference and advanced options.
 
 ## Table of Contents
 
 - [What You'll Need](#what-youll-need)
-- [Step 1 — Subscribe to AMIs](#step-1--subscribe-to-amis)
+- [Step 1 — Make the AMIs Available](#step-1--make-the-amis-available)
 - [Step 2 — Create the Template Bucket](#step-2--create-the-template-bucket)
 - [Step 3 — Deploy the Stack](#step-3--deploy-the-stack)
 - [What to Expect](#what-to-expect)
@@ -23,7 +24,7 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for the full parameter reference and advanced
 Complete this checklist before starting. All five items are required.
 
 - [ ] **AWS account** with IAM permissions to deploy CloudFormation stacks with `CAPABILITY_NAMED_IAM`.
-  A minimal IAM policy is in [DEPLOYMENT.md](DEPLOYMENT.md#5-aws-permissions).
+  A minimal IAM policy is in [DEPLOYMENT.md — AWS Permissions](DEPLOYMENT.md#aws-permissions).
 
 - [ ] **AWS CLI** installed and configured (`aws configure` or environment variables set).
   Verify with: `aws sts get-caller-identity`
@@ -49,45 +50,61 @@ Complete this checklist before starting. All five items are required.
 > itself (Step 2), because it is larger than CloudFormation's 51 KB direct-upload limit.
 
 > **Optional — AI Guardrails:** the template can also deploy a GPU-backed AI Guardrails tier
-> (`GuardrailsImageS3Bucket` + `GuardrailsAmiId`). It needs the `aisecurity-llm.tgz` tarball in an S3 bucket, a Deep Learning Base GPU AMI,
-> and G-instance quota, and adds a second readiness gate (multi-GB image pull) to stack creation.
-> This guide leaves it disabled;
-> see [DEPLOYMENT.md — AI Guardrails (optional)](DEPLOYMENT.md#ai-guardrails-optional).
+> (`GuardrailsImageS3Bucket` + `GuardrailsAmiId`). It needs the `aisecurity-llm.tgz` tarball in an
+> S3 bucket, a Deep Learning Base GPU AMI, and G-instance quota. Stack creation then also waits on
+> a CloudFormation wait condition that the first Guardrails instance signals once its container
+> passes `/ping` (the image is pulled from S3 onto local NVMe; allow up to 15 minutes). This guide
+> leaves it disabled; see
+> [DEPLOYMENT.md — AI Guardrails Prerequisites](DEPLOYMENT.md#ai-guardrails-prerequisites-optional).
 
 ---
 
-## Step 1 — Subscribe to AMIs
+## Step 1 — Make the AMIs Available
 
-Both the AI Gateway and DLP On Demand AMIs must be subscribed to in AWS Marketplace before the
-stack can launch instances. Subscription is free — you pay only for EC2 instance hours.
+Both AMIs must be available in your AWS account before the stack can launch instances. They are
+obtained differently: the AI Gateway AMI is an AWS Marketplace subscription; the DLP On Demand AMI
+is shared privately to your account from the Netskope console.
 
-**AI Gateway:**
+**AI Gateway (AWS Marketplace):**
 1. Go to [AWS Marketplace](https://aws.amazon.com/marketplace) and search for **Netskope AI Gateway**
 2. Click **Continue to Subscribe**
 3. Accept the terms and click **Accept Terms**
 4. Wait for the subscription to activate (typically 1–2 minutes)
 
-**DLP On Demand:**
-1. In AWS Marketplace, search for **Netskope DLP On Demand**
-2. Click **Continue to Subscribe**
-3. Accept the terms and click **Accept Terms**
+**DLP On Demand (shared from the Netskope console — not on Marketplace):**
+1. In your Netskope tenant: **Security Cloud Platform → On-Premises Infrastructure →
+   Setup DLP On Demand → AWS → Share Image**
+2. Enter your AWS account ID and choose the region — the region is fixed at share time
+3. The AMI appears in that region under **EC2 → AMIs → Private images**. See the
+   [DLP On Demand configuration guide](https://docs.netskope.com/en/dlpondemandconfig) for details
 
 > **Region note:** The AMI defaults (`GatewayAmiId` = `ami-0a66805d7fb085df4`,
-> `DlpodAmiId` = `ami-0973780ab75c2fb28`) are for **us-west-1 only**.
-> If deploying in a different region, look up the AMI IDs after subscribing:
+> `DlpodAmiId` = `ami-0973780ab75c2fb28`) are for **us-west-1 only**. The DLPoD default launches
+> only if that exact image has been shared to your account in us-west-1 — otherwise the stack
+> fails at DLPoD instance launch. If deploying in a different region (or a different image was
+> shared), look up the AMI IDs:
 > ```bash
+> REGION=<region>
+>
+> # AI Gateway (Marketplace)
 > aws ec2 describe-images \
 >   --filters 'Name=name,Values=*Netskope AI Gateway*' \
 >   --query 'sort_by(Images, &CreationDate)[-1].[ImageId,Name]' \
->   --output table --region <your-region>
+>   --output table --region $REGION
+>
+> # DLP On Demand (privately shared; the name filter is indicative only)
+> aws ec2 describe-images \
+>   --filters 'Name=name,Values=*Netskope DLP*' Name=is-public,Values=false \
+>   --query 'sort_by(Images, &CreationDate)[-1].[ImageId,Name]' \
+>   --output table --region $REGION
 > ```
-> Pass the result as `GatewayAmiId` (and similarly `DlpodAmiId`) in Step 3.
+> Pass the results as `GatewayAmiId` and `DlpodAmiId` in Step 3.
 
 ---
 
 ## Step 2 — Create the Template Bucket
 
-**Why this step:** `templates/gateway-combined.yaml` is about 68 KB, which exceeds CloudFormation's
+**Why this step:** `templates/gateway-combined.yaml` is about 71 KB, which exceeds CloudFormation's
 51 KB limit for direct template upload (`--template-body` or the console file picker). The template
 must be stored in an S3 bucket **in the same region as your stack**, and CloudFormation reads it
 from there. Nothing else goes in the bucket — there are no Lambda packages or layers to upload.
@@ -95,12 +112,13 @@ from there. Nothing else goes in the bucket — there are no Lambda packages or 
 ### Option A — Script (recommended)
 
 ```bash
-scripts/deploy-artifacts.sh <region>
+REGION=<region>   # your target deployment region (same value as in Step 1)
+scripts/deploy-artifacts.sh $REGION
 ```
 
 This creates a bucket named `netskope-aigw-templates-<account-id>` in the target region (or
 reuses it if it already exists) and prints the bucket name at the end. To use a different bucket
-name: `LAMBDA_BUCKET=<name> scripts/deploy-artifacts.sh <region>`.
+name: `TEMPLATE_BUCKET=<name> scripts/deploy-artifacts.sh $REGION`.
 
 ### Option B — Manual (AWS Console)
 
@@ -124,9 +142,19 @@ its S3 URL. You can deploy from the AWS CLI or entirely from the AWS Console.
 
 ### Option A — AWS CLI
 
+Export the credentials first so they stay out of your shell history and the command line:
+
+```bash
+export NETSKOPE_TENANT_URL=https://tenant.goskope.com
+export NETSKOPE_API_TOKEN=<token>
+export DLPOD_LICENSE_KEY=<license-key>
+```
+
+Then upload and deploy:
+
 ```bash
 BUCKET=netskope-aigw-templates-<account-id>   # from Step 2
-REGION=<region>
+REGION=<region>                               # same region as the bucket
 STACK=<stack-name>
 
 # Upload the template to S3
@@ -138,9 +166,9 @@ aws cloudformation create-stack \
   --stack-name $STACK \
   --template-url https://$BUCKET.s3.$REGION.amazonaws.com/templates/gateway-combined.yaml \
   --parameters \
-    ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
-    ParameterKey=NetskopeApiToken,ParameterValue=<token> \
-    ParameterKey=DlpodLicenseKey,ParameterValue=<license-key> \
+    ParameterKey=NetskopeTenantUrl,ParameterValue=$NETSKOPE_TENANT_URL \
+    ParameterKey=NetskopeApiToken,ParameterValue=$NETSKOPE_API_TOKEN \
+    ParameterKey=DlpodLicenseKey,ParameterValue=$DLPOD_LICENSE_KEY \
   --tags Key=Project,Value=aigw Key=Environment,Value=prod Key=ManagedBy,Value=CloudFormation \
   --capabilities CAPABILITY_NAMED_IAM \
   --region $REGION
@@ -149,17 +177,15 @@ aws cloudformation create-stack \
 Only these three parameters are required. All others use defaults. The `--tags` line passes
 `Project`, `Environment`, and `ManagedBy` tags to all stack resources (`Project` and `Environment`
 are not template parameters — use tags). The stack auto-generates a self-signed certificate for the
-AI Gateway ALB — omitting `AcmCertificateArn` is intentional. To use a custom ACM certificate,
+AIG ALB — omitting `AcmCertificateArn` is intentional. To use a custom ACM certificate,
 add: `ParameterKey=AcmCertificateArn,ParameterValue=<arn>`.
 
 Override `GatewayAmiId` and `DlpodAmiId` when deploying outside us-west-1:
 `ParameterKey=GatewayAmiId,ParameterValue=<ami-id> ParameterKey=DlpodAmiId,ParameterValue=<ami-id>`.
 
-> **Tip:** to keep the token and license key out of your shell history, export them first
-> (`export NETSKOPE_API_KEY=...`, `export DLPOD_LICENSE_KEY=...`) and reference
-> `ParameterValue=$NETSKOPE_API_KEY` / `ParameterValue=$DLPOD_LICENSE_KEY`.
-
 ### Option B — AWS Console (no CLI required)
+
+This is the canonical console walkthrough; DEPLOYMENT.md links here.
 
 **1. Upload the template to S3**
 
@@ -198,12 +224,12 @@ Leave all other parameters at their defaults. In particular:
 | Parameter | Default | Notes |
 |---|---|---|
 | `AcmCertificateArn` | *(blank)* | Leave **blank** to auto-generate a self-signed certificate |
-| `GatewayAmiId` / `DlpodAmiId` | us-west-1 AMIs | Override only when deploying outside **us-west-1** |
+| `GatewayAmiId` / `DlpodAmiId` | us-west-1 AMIs | Override only when deploying outside **us-west-1** (see the Step 1 region note) |
 | `InstanceType` / `DlpodInstanceType` | `m5.4xlarge` / `c5a.4xlarge` | Sizing — see [ARCHITECTURE.md](ARCHITECTURE.md#instance-sizing-and-throughput) |
 | `DesiredCapacity` / `DlpodDesiredCapacity` | `1` / `1` | Initial instance counts (1–4) |
-| `ScaleOutCpuThreshold` | `70` | Average CPU % that adds an AI Gateway instance |
+| `ScaleOutCpuThreshold` | `70` | Average CPU % that adds an AIG instance |
 | `VpcCidr` | `10.0.0.0/16` | New VPC CIDR; subnets are derived automatically |
-| `GuardrailsImageS3Bucket` and other `Guardrails*` | *(blank / disabled)* | Leave blank to skip the optional Guardrails tier |
+| `GuardrailsImageS3Bucket` and other `Guardrails*` | *(blank / disabled)* | Leave blank to skip the optional AI Guardrails tier |
 
 Click **Next**.
 
@@ -216,7 +242,7 @@ Under **Tags**, add `Project`, `Environment`, and `ManagedBy` tags (e.g. `aigw`,
 
 On the review page, scroll to the bottom and check the box:
 
-> ☑ **I acknowledge that AWS CloudFormation might create IAM resources with custom names.**
+> **I acknowledge that AWS CloudFormation might create IAM resources with custom names.**
 
 Click **Submit**. CloudFormation opens the stack events view — refresh to watch progress.
 
@@ -224,82 +250,60 @@ Click **Submit**. CloudFormation opens the stack events view — refresh to watc
 
 ## What to Expect
 
-Stack creation takes approximately **12–18 minutes** and is strictly ordered: DLP On Demand must
-be healthy before the first AI Gateway instance launches.
+Stack creation takes approximately **12–18 minutes** and is strictly ordered: DLPoD must be
+healthy before the first AIG instance launches.
 
 | Phase | Time | What's happening |
 |---|---|---|
 | Certificates + bootstrap | ~1 min | `<stack>-certgen` generates the DLPoD TLS hierarchy; `<stack>-dlpod-bootstrap-builder` assembles `bootstrap.json` into the DLPoD launch template UserData |
 | DLP On Demand | 5–10 min from instance launch | Appliance's `nsbootstrap.service` applies the cert, license key, DNS, and persona from UserData; DLPoD ALB target becomes healthy |
-| Readiness gate | until DLPoD healthy (max 14 min) | `DlpodReadinessGate` shows `CREATE_IN_PROGRESS` while it polls target health — this is normal |
-| AI Gateway | 5–15 min from instance launch | Activation Lambda registers the appliance with Netskope; instance reads the bootstrap secret at boot and self-enrolls with DLP forwarding configured |
+| Readiness gate | until DLPoD healthy (max 840 s) | `DlpodReadinessGate` shows `CREATE_IN_PROGRESS` while it polls target health — this is normal |
+| AI Gateway | 5–15 min from instance launch | Activation Lambda registers the appliance with Netskope and writes the bootstrap secret; the instance reads it at boot and self-enrolls with DLP forwarding configured |
 
-At `CREATE_COMPLETE` the DLPoD tier is already healthy; the AI Gateway instance may still be
-finishing enrollment for a few minutes (the AIG ASG grace period is 10 minutes). DLP inspection is
-active as soon as the AI Gateway ALB target is healthy.
+At `CREATE_COMPLETE` the DLPoD tier is already healthy; the AIG instance may still be finishing
+enrollment for a few minutes (the AIG ASG grace period is 10 minutes). DLP inspection is active as
+soon as the AIG ALB target is healthy.
 
-> **About the self-signed certificate:** The AI Gateway ALB presents a self-signed certificate
+> **About the self-signed certificate:** The AIG ALB presents a self-signed certificate
 > (`aig.aigw.internal` as CN/SAN). API clients must be configured to trust the cert or skip TLS
 > verification. Browsers will show a security warning. This is expected behavior for the default
-> deployment. See [DEPLOYMENT.md — ACM Certificate](DEPLOYMENT.md#4-acm-certificate-optional) to
+> deployment. See [DEPLOYMENT.md — ACM Certificate](DEPLOYMENT.md#acm-certificate-optional) to
 > use a trusted certificate instead.
 
 ---
 
 ## Verify Deployment
 
-Run these checks after `CREATE_COMPLETE`:
+Run these three checks after `CREATE_COMPLETE` (`$STACK` and `$REGION` from Step 3). The full
+command set — DLPoD target health, bootstrap secret contents, per-tier ASG state — is in
+[DEPLOYMENT.md — Verify Deployment](DEPLOYMENT.md#verify-deployment).
 
 **1. Stack outputs (get the ALB DNS name and other values):**
 ```bash
-aws cloudformation describe-stacks --stack-name <stack-name> \
+aws cloudformation describe-stacks --stack-name $STACK \
   --query "Stacks[0].Outputs[*].[OutputKey,OutputValue]" \
-  --output table --region <region>
+  --output table --region $REGION
 ```
 
 **2. AI Gateway instances in service:**
 ```bash
 aws autoscaling describe-auto-scaling-groups \
-  --auto-scaling-group-names <stack-name>-aig-asg \
+  --auto-scaling-group-names $STACK-aig-asg \
   --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" \
-  --output table --region <region>
+  --output table --region $REGION
 ```
-Look for `InService` / `Healthy`.
+Look for `InService` / `Healthy`. `Pending:Wait` for up to 15 minutes after launch is normal
+while the Activation Lambda registers the appliance and the instance enrolls.
 
-**3. DLP On Demand bootstrap:**
+**3. Quick connectivity test:**
 ```bash
-# ALB target health — "healthy" means nsbootstrap completed and HTTPS is serving
-aws elbv2 describe-target-health \
-  --target-group-arn $(aws elbv2 describe-target-groups \
-    --names <stack-name>-dlpod-tg --query "TargetGroups[0].TargetGroupArn" \
-    --output text --region <region>) \
-  --query "TargetHealthDescriptions[*].[Target.Id,TargetHealth.State,TargetHealth.Reason]" \
-  --output table --region <region>
-
-# Bootstrap builder Lambda log — confirms bootstrap.json was assembled at stack creation
-aws logs tail /aws/lambda/<stack-name>-dlpod-bootstrap-builder --since 1h --region <region>
-```
-`healthy` = bootstrapped and serving. `initial` or `unhealthy` for less than 10 minutes after
-launch is normal while `nsbootstrap` runs. There is no orchestration service to inspect —
-`nsbootstrap.service` runs on the appliance itself.
-
-**4. DLP On Demand instances in service:**
-```bash
-aws autoscaling describe-auto-scaling-groups \
-  --auto-scaling-group-names <stack-name>-dlpod-asg \
-  --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" \
-  --output table --region <region>
-```
-
-**5. Quick connectivity test:**
-```bash
-AIG_ALB=$(aws cloudformation describe-stacks --stack-name <stack-name> \
+AIG_ALB=$(aws cloudformation describe-stacks --stack-name $STACK \
   --query "Stacks[0].Outputs[?OutputKey=='AigAlbDnsName'].OutputValue" \
-  --output text --region <region>)
+  --output text --region $REGION)
 
 curl -sk -o /dev/null -w "HTTP %{http_code}\n" https://$AIG_ALB/
 ```
-`HTTP 200` or `HTTP 401` (auth required) confirms the AI Gateway is serving requests.
+`HTTP 200` or `HTTP 401` (auth required) confirms the AIG is serving requests.
 
 ---
 

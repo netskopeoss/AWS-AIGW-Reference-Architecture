@@ -2,9 +2,6 @@
 *.zip
 *.bak
 
-# Pre-built Lambda artifacts (tracked intentionally for user convenience)
-!dist/*.zip
-
 # IDE
 .idea/
 *.iml
@@ -39,14 +36,4 @@ templates/gateway-simple.yaml
 templates/test-ssh-tunnel.yaml
 templates/test-step-function.yaml
 
-# Local TUI files (pexpect-based, not used in Lambda)
-libs/tui/config.py
-libs/tui/config_publickey.py
-libs/tui/tui_helpers.py
-libs/tui/tui_session.py
-libs/tui/tui_session_publickey.py
-libs/tui/base_test.py
-libs/tui/utils/__init__.py
-libs/tui/utils/enrollment.py
-libs/tui/utils/csr.py
 /dlpod/docs/DataSecurityTeam-Support bootstrap for zero touch inital configuration in DLPoD Appliance-250826-165246.pdf

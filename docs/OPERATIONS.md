@@ -1,112 +1,73 @@
 # Operations Guide — AI Gateway + DLP On Demand
 
 Day-2 operations reference for `templates/gateway-combined.yaml`. Written for DevOps engineers
-who know AWS well but may be new to Netskope. Covers the Netskope side of both services before
-diving into operational procedures.
+who know AWS well but may be new to Netskope. Background on what the appliances are and how the
+stack is laid out lives in [ARCHITECTURE.md](ARCHITECTURE.md); this guide is about operating a
+running stack.
+
+Shell examples in this document assume:
+
+```bash
+STACK=<stack-name>
+REGION=<region>
+```
 
 ## Table of Contents
 
-- [What Is the AI Gateway?](#what-is-the-ai-gateway)
-- [What Is DLP On Demand?](#what-is-dlp-on-demand)
-- [Architecture](#architecture)
+- [Background](#background)
 - [Startup Sequence](#startup-sequence)
 - [Monitoring and Alerts](#monitoring-and-alerts)
 - [Key Operational Commands](#key-operational-commands)
 - [Scaling](#scaling)
 - [AMI Upgrade Procedure](#ami-upgrade-procedure)
+- [Certificate Renewal](#certificate-renewal)
 - [IAM Roles](#iam-roles)
 - [Secrets and SSM Parameters](#secrets-and-ssm-parameters)
 - [Troubleshooting](#troubleshooting)
 
 ---
 
-## What Is the AI Gateway?
+## Background
 
-The Netskope AI Gateway is a software appliance that runs as an EC2 instance in your VPC. It
-acts as an inline proxy between AI-powered applications and large language model providers
-(AWS Bedrock, OpenAI, Anthropic, etc.). Every prompt and response passes through the gateway
-before reaching its destination.
+### What Is the AI Gateway?
 
-**What it does operationally:**
-- Presents an OpenAI-compatible HTTPS API to clients — no application code changes required
-- Enrolls with the Netskope management plane at boot using a one-time token from Secrets Manager
-- Forwards content to DLP On Demand for scanning before passing it to the LLM provider
-- Receives security policies, DLP profiles, and access controls from the Netskope management plane
-- Records all AI interactions (prompts, responses, blocks) to the Netskope management plane
+The Netskope AI Gateway (AIG) is a software appliance that runs as an EC2 instance in your VPC and
+acts as an inline, OpenAI-compatible HTTPS proxy between AI applications and LLM providers. It
+enrolls with the Netskope management plane at boot using a one-time token that the Activation
+Lambda places in Secrets Manager, forwards content to DLP On Demand for inspection, receives
+policies from the tenant, and records every AI interaction there. See
+[ARCHITECTURE.md — AI Gateway tier](ARCHITECTURE.md#ai-gateway-aig--internet-facing-tier).
 
-**How enrollment works:**
-When an instance launches, a lifecycle hook holds it in `Pending:Wait`. The Activation Lambda
-registers the appliance with the Netskope API, receives an enrollment token, and writes it to
-the bootstrap secret in Secrets Manager. The instance reads the bootstrap secret at boot and
-self-enrolls. The lifecycle hook completes, the instance enters `InService`, and the ALB
-health check passes once the gateway service is up.
+### What Is DLP On Demand?
 
----
+DLP On Demand (DLPoD) is a content-inspection appliance that the AIG forwards content to over
+HTTPS:443 at `dlp.aigw.internal`. It runs in your VPC — content never leaves your AWS account for
+DLP scanning. It self-configures at first boot from a `bootstrap.json` document delivered in EC2
+UserData (TLS cert + key, license key, DNS resolver, `dlp-on-demand` persona); there is no SSH,
+lifecycle hook, or orchestration service. Once licensed it connects outbound to the Netskope
+management plane via the NAT Gateway and downloads DLP profiles. See
+[ARCHITECTURE.md — DLP On Demand tier](ARCHITECTURE.md#dlp-on-demand-dlpod--internal-inspection-tier).
 
-## What Is DLP On Demand?
+### Layout
 
-DLP On Demand is a content inspection appliance that the AI Gateway forwards content to for
-data loss prevention analysis. It runs in your VPC — content never leaves your AWS account for
-DLP scanning. It exposes a REST API on HTTPS port 443 and applies Netskope DLP policies to the
-content it receives.
-
-**How bootstrap works:**
-DLP On Demand self-configures at first boot. The stack delivers a `bootstrap.json` document to
-each instance through EC2 UserData; the appliance's `nsbootstrap.service` reads it at first boot
-and applies the TLS server certificate and key, the license key, the DNS resolver, and the
-`dlp-on-demand` persona. No SSH, no lifecycle hook, and no orchestration service is involved —
-the instance is `InService` in the ASG as soon as it launches and becomes usable once the DLPoD
-ALB health check passes (typically 5–10 minutes after launch).
-
-Once licensed, DLP On Demand connects outbound to the Netskope management plane (via the NAT
-Gateway), receives DLP profiles, and begins inspecting content forwarded from AI Gateway
-instances.
-
----
-
-## Architecture
-
-```
-                     VPC (10.0.0.0/16)
-                     ┌────────────────────────────────────────────────────────┐
-Internet             │  Public subnets (AZ1/AZ2)                              │
-    │                │  ┌──────────────────────────────────────────────────┐  │
-    └── AIG ALB ─────┤  │ AIG ALB nodes  │  NAT Gateway (AZ1)             │  │
-        HTTPS:443    │  └──────────────────────────────────────────────────┘  │
-                     │                                                         │
-                     │  Private subnets (AZ1/AZ2)                            │
-                     │  ┌──────────────────────────────────────────────────┐  │
-                     │  │ AIG instances (ASG, min 1 / max 4)               │  │
-                     │  │   ↓ DLP inspection                               │  │
-                     │  │ DLPoD ALB (internal, dlp.aigw.internal)          │  │
-                     │  │   ↓                                               │  │
-                     │  │ DLPoD instances (ASG, default 1)                 │  │
-                     │  └──────────────────────────────────────────────────┘  │
-                     └────────────────────────────────────────────────────────┘
-
-Route 53 private zone: aigw.internal
-  dlp.aigw.internal → DLPoD internal ALB
-
-AIG internet-facing ALB:  HTTPS:443 → AIG instances → LLM providers (via NAT GW)
-                                            ↕ dlp.aigw.internal → DLPoD instances
-```
-
-### Component separation
-
-| Component | Subnet | ALB | DNS |
-|---|---|---|---|
-| AIG ASG | Private AZ1 + AZ2 | Internet-facing (public subnets) | `AigAlbDnsName` output or custom CNAME |
-| DLPoD ASG | Private AZ1 + AZ2 | Internal (private subnets) | `dlp.aigw.internal` (Route 53 private zone) |
+One VPC, two AZs. AIG instances (ASG `<stack>-aig-asg`, min 1 / max 4) sit behind an
+internet-facing ALB in the public subnets; DLPoD instances (ASG `<stack>-dlpod-asg`, min 1 / max 4)
+sit behind an internal ALB in the private subnets, reached via the Route 53 private zone
+`aigw.internal`. All instances are in private subnets and egress through one NAT Gateway. The
+optional AI Guardrails tier (ASG `<stack>-guardrails-asg`, GPU instances behind an internal HTTP
+ALB at `guardrails.aigw.internal:8080`) is present only when `GuardrailsImageS3Bucket` was set.
+Diagrams and per-tier detail: [ARCHITECTURE.md](ARCHITECTURE.md#architecture-diagram).
 
 ---
 
 ## Startup Sequence
 
-Stack creation is strictly ordered: DLPoD must be healthy before the first AIG instance launches.
-`GatewayAutoScalingGroup` has `DependsOn: DlpodReadinessGate`, a custom resource that polls the
-DLPoD ALB target group until every target is healthy. The AI Gateway validates the DLPoD HTTPS
-endpoint during enrollment, so this gate guarantees the endpoint is serving before AIG boots.
-Total creation time is 12–18 minutes (DLPoD bootstrap ~5–10 min, then AIG enrollment ~5–15 min).
+Stack creation is strictly ordered: DLPoD (and Guardrails, if deployed) must be serving before the
+first AIG instance launches. `GatewayAutoScalingGroup` has `DependsOn: DlpodReadinessGate` (and
+`GuardrailsReadinessGate` when deployed). The AIG validates the DLPoD HTTPS endpoint and the
+Guardrails host during enrollment, so these gates guarantee the endpoints exist before AIG boots.
+Total creation time is 12–18 minutes (DLPoD bootstrap ~5–10 min, then AIG enrollment ~5–15 min);
+longer with Guardrails.
 
 For the full traffic-flow context of each sequence, see
 [ARCHITECTURE.md — Traffic Flows](ARCHITECTURE.md#traffic-flows). The same ordering is described
@@ -137,7 +98,7 @@ Stack creation
              limited to 4 KB); DlpodLaunchTemplate re-joins them as the instance UserData
 ```
 
-The AIG side does not read the bootstrap UserData. Instead, the AIG Activation Lambda reads the
+The AIG side does not read the bootstrap UserData. Instead, the Activation Lambda reads the
 CA cert from `/<stack>/dlpod-cert` at every AIG instance launch and writes it, together with the
 fixed DLP host `https://dlp.aigw.internal`, into the AIG bootstrap secret (see the AIG flow below).
 
@@ -148,7 +109,7 @@ fixed DLP host `https://dlp.aigw.internal`, into the AIG bootstrap secret (see t
 
 ---
 
-### DLPoD bootstrap flow (per instance, ~5–10 min)
+### DLPoD bootstrap flow (per instance, ~5–10 min to ALB-healthy)
 
 Runs for every DLPoD instance that launches — at stack creation and on every scale-out or
 replacement. There is no lifecycle hook, Lambda, or orchestration per instance: the launch
@@ -177,16 +138,58 @@ Instance launch
            └─ Instance begins receiving DLP inspection traffic from AIG
 ```
 
-**Readiness gate (stack creation only):** after `DlpodAutoScalingGroup` is created, the
+The ALB health check confirms only that the appliance answers on 443. Netskope's setup guide
+states the appliance needs roughly 30 minutes after tethering to fully initialise (download DLP
+profiles and report ready), so a target can be healthy in the ALB before inspection is fully
+effective. Confirm appliance status in the Netskope console (Security Cloud Platform >
+On-Premises Infrastructure) after a new instance appears healthy.
+
+**DLPoD readiness gate (stack creation only):** after `DlpodAutoScalingGroup` is created, the
 `DlpodReadinessGate` custom resource (inline Lambda `<stack>-dlpod-readiness`, log group
 `/aws/lambda/<stack>-dlpod-readiness`) polls `describe-target-health` on the DLPoD target group
 every 30 seconds. It returns `SUCCESS` when all targets are healthy and `FAILED` (rolling the stack
-back) if that has not happened within 14 minutes. `GatewayAutoScalingGroup` depends on this
-resource, so no AIG instance launches until DLPoD is serving. The gate only runs on stack create —
-it is a no-op on update and delete, and does not apply to later scale-outs.
+back) if that has not happened within 840 seconds (14 minutes; the Lambda's own timeout is 900 s).
+The failure reason in `describe-stack-events` reads
+`Targets in <stack>-dlpod-tg did not become healthy within 840s`. `GatewayAutoScalingGroup`
+depends on this resource, so no AIG instance launches until DLPoD is serving. The gate only runs
+on stack create — it is a no-op on update and delete, and does not apply to later scale-outs.
 
 **On termination:** There is no termination hook. The instance is terminated by the ASG and the
 ALB deregisters the target. The Netskope management plane detects the appliance disconnect.
+
+---
+
+### Guardrails startup flow (per instance, only when deployed)
+
+Each Guardrails instance runs the launch-template UserData at boot, logging to
+`/var/log/user-data.log`:
+
+```
+Instance launch
+  │
+  ├─ 1. ASG launches GPU instance from GuardrailsLaunchTemplate (HealthCheckType: EC2, no grace period)
+  ├─ 2. UserData: nvidia-smi (fail fast if the driver is missing)
+  ├─ 3. UserData mounts the local NVMe instance store (/opt/dlami/nvme) — falls back to /tmp on
+  │      the EBS root if no instance store is found (much slower; see the note below)
+  ├─ 4. UserData installs Docker / NVIDIA Container Toolkit if absent, moves Docker data-root onto
+  │      the NVMe mount, downloads s3://<GuardrailsImageS3Bucket>/<GuardrailsImageS3Key> to it,
+  │      docker load, then docker run --gpus all --restart=unless-stopped -p 8080:8080
+  ├─ 5. UserData polls http://localhost:8080/ping every 10 s, up to 90 times (15 min)
+  │      └─ 200 → curl PUT SUCCESS to the GuardrailsWaitHandle URL
+  │      └─ timeout or any script error → curl PUT FAILURE
+  └─ 6. Guardrails ALB health check (HTTP GET /ping, 200, 30 s interval, 2 passes) → target healthy
+```
+
+**Guardrails readiness gate (stack creation only):** `GuardrailsReadinessGate` is an
+`AWS::CloudFormation::WaitCondition` (`Count: 1`, `Timeout: 3600`). It is satisfied by the first
+Guardrails instance's SUCCESS signal and fails the stack (rollback) if a FAILURE signal arrives or
+no signal arrives within 60 minutes. In practice the UserData's own 15-minute limit is what fires.
+This gate does not use the readiness Lambda, so nothing about it appears in
+`/aws/lambda/<stack>-dlpod-readiness`; the signal `Reason` (for example
+`Container not healthy after 15 min`) is recorded in `describe-stack-events`, and the detail is in
+`/var/log/user-data.log` on the instance (SSM Session Manager). Like the DLPoD gate, it only
+matters during stack creation — later launches still run the same UserData and still `curl` the
+handle URL, but CloudFormation ignores signals to a completed WaitCondition.
 
 ---
 
@@ -203,7 +206,8 @@ Instance launch
   │       └─ Lifecycle hook holds instance in Pending:Wait (HeartbeatTimeout: 120s / 2 min)
   │           If the Activation Lambda does not complete within 2 min → instance ABANDONED
   │
-  ├─ 2. ASG lifecycle event → SNS topic → AigActivationFunction (Lambda)
+  ├─ 2. ASG lifecycle event → SNS topic → Activation Lambda (AigActivationLambdaFunction,
+  │       function name <stack>-aig-activation)
   │       │
   │       ├─ a. Reads API credentials from Secrets Manager (<stack>-netskope-credentials)
   │       │         { "tenant_url": "...", "api_token": "..." }
@@ -238,10 +242,11 @@ Instance launch
            └─ Self-enrolls with Netskope tenant using enrollment_token
            └─ Configures DLP forwarding to https://dlp.aigw.internal using the DLP block
            └─ Starts the AI Gateway service
-           └─ ALB health check passes (HTTPS GET / on port 443) → serving requests
+           └─ ALB health check passes (HTTPS GET / on port 443, 10 s interval) → serving requests
+               (HealthCheckType: ELB, HealthCheckGracePeriod: 600s)
 ```
 
-**On termination:** The AIG termination lifecycle hook fires → AigActivationFunction reads the
+**On termination:** The AIG termination lifecycle hook fires → the Activation Lambda reads the
 appliance id from `/aig/<stack>/<instance-id>` → calls `DELETE /api/v2/aig/appliances/{id}` to
 deregister from the Netskope tenant → deletes the SSM parameter → completes the lifecycle hook
 (`CONTINUE` even if deregistration fails, so termination is never blocked).
@@ -253,8 +258,8 @@ deregister from the Netskope tenant → deletes the SSM parameter → completes 
 
 > **DLP traffic:** AIG instances configure DLP forwarding from their first boot. At stack creation
 > the readiness gate guarantees DLPoD is healthy first. On later AIG scale-outs, if the DLPoD ALB
-> has no healthy targets, the AI Gateway continues serving requests but DLP inspection is not
-> applied until a healthy DLPoD target is available.
+> has no healthy targets, the AIG continues serving requests but DLP inspection is not applied
+> until a healthy DLPoD target is available.
 
 ---
 
@@ -262,12 +267,18 @@ deregister from the Netskope tenant → deletes the SSM parameter → completes 
 
 ### Log Groups
 
-| Log group | Contents | Typical volume |
-|---|---|---|
-| `/aws/lambda/<stack>-aig-activation` | AIG enrollment/deregistration events, Netskope API calls, lifecycle hook completion | ~10 lines per instance launch/termination |
-| `/aws/lambda/<stack>-certgen` | Cert hierarchy generation, ACM import, SSM and Secrets Manager writes | ~5 lines at stack creation (and delete) only |
-| `/aws/lambda/<stack>-dlpod-bootstrap-builder` | `bootstrap.json` assembly — size of the base64 UserData and each half | ~2 lines at stack creation only |
-| `/aws/lambda/<stack>-dlpod-readiness` | Readiness gate polls: `N/M target(s) healthy — waiting 30s...` for DLPoD (and Guardrails, if deployed) | ~1 line per 30 s during stack creation only |
+The stack creates four CloudWatch log groups, one per inline Lambda function. This table is the
+canonical reference; SECURITY.md links here.
+
+| Log group | Contents | Retention | Typical volume |
+|---|---|---|---|
+| `/aws/lambda/<stack>-aig-activation` | AIG enrollment/deregistration events, Netskope API calls, lifecycle hook completion | 30 days | ~10 lines per instance launch/termination |
+| `/aws/lambda/<stack>-certgen` | Cert hierarchy generation, ACM import, SSM and Secrets Manager writes | 30 days | ~5 lines at stack creation (and delete) only |
+| `/aws/lambda/<stack>-dlpod-bootstrap-builder` | `bootstrap.json` assembly — size of the base64 UserData and each half, never contents | 30 days | ~2 lines at stack creation/update only |
+| `/aws/lambda/<stack>-dlpod-readiness` | DLPoD readiness gate polls: `N/M target(s) healthy — waiting 30s...` | 7 days | ~1 line per 30 s during stack creation only |
+
+The Guardrails readiness gate is a WaitCondition signalled from instance UserData and writes to
+none of these groups; its output is `/var/log/user-data.log` on the Guardrails instance.
 
 DLPoD instances themselves write no CloudWatch logs from the stack's perspective —
 `nsbootstrap.service` runs on the appliance. Its status is observable only through the DLPoD ALB
@@ -276,7 +287,7 @@ documentation for appliance-side diagnostics.
 
 Tail any log group in real time:
 ```bash
-aws logs tail /aws/lambda/<stack>-aig-activation --follow --region <region>
+aws logs tail /aws/lambda/$STACK-aig-activation --follow --region $REGION
 ```
 
 ### Built-in CloudWatch Alarm
@@ -285,24 +296,24 @@ The stack creates one CloudWatch alarm automatically:
 
 | Alarm | Metric | Threshold | Action |
 |---|---|---|---|
-| `<stack>-aig-high-cpu` | `AWS/EC2 CPUUtilization` on AIG ASG | Average ≥ `ScaleOutCpuThreshold` (default 70%) for 2 consecutive 5-min periods | Step scaling — adds one AIG instance |
+| `<stack>-aig-high-cpu` | `AWS/EC2 CPUUtilization`, Average, on the AIG ASG | Strictly greater than `ScaleOutCpuThreshold` (default 70 %) for 2 consecutive 5-min periods (`GreaterThanThreshold`) | Step scaling — adds one AIG instance |
 
 Check alarm state:
 ```bash
-aws cloudwatch describe-alarms --alarm-names <stack>-aig-high-cpu \
-  --query "MetricAlarms[0].[StateValue,StateReason]" --output table --region <region>
+aws cloudwatch describe-alarms --alarm-names $STACK-aig-high-cpu \
+  --query "MetricAlarms[0].[StateValue,StateReason]" --output table --region $REGION
 ```
 
-`INSUFFICIENT_DATA` is normal at minimum capacity with low traffic. `ALARM` triggers scale-out.
+The alarm sets `TreatMissingData: notBreaching`, so its steady state is `OK` even at minimum
+capacity with little traffic (missing datapoints are treated as within threshold rather than
+producing `INSUFFICIENT_DATA`). `ALARM` triggers scale-out. There is no scale-in alarm or policy —
+scale-in is manual (see [Scaling](#scaling)).
 
 ### Recommended Additional Alarms
 
 These alarms are not created by the stack but are useful for production deployments:
 
 ```bash
-STACK=<stack-name>
-REGION=<region>
-
 # Alert when AIG ASG has fewer instances than desired (instance failures)
 aws cloudwatch put-metric-alarm \
   --alarm-name "$STACK-aig-below-desired" \
@@ -327,7 +338,7 @@ aws cloudwatch put-metric-alarm \
   --alarm-description "DLPoD has no healthy targets — DLP inspection unavailable" \
   --region $REGION
 
-# Alert on AIG Activation Lambda errors
+# Alert on Activation Lambda errors
 aws cloudwatch put-metric-alarm \
   --alarm-name "$STACK-aig-activation-errors" \
   --metric-name Errors \
@@ -335,78 +346,210 @@ aws cloudwatch put-metric-alarm \
   --dimensions Name=FunctionName,Value=$STACK-aig-activation \
   --statistic Sum --period 300 --threshold 1 \
   --comparison-operator GreaterThanOrEqualToThreshold --evaluation-periods 1 \
-  --alarm-description "AIG Activation Lambda errors — enrollment failures" \
+  --alarm-description "Activation Lambda errors — enrollment failures" \
+  --region $REGION
+
+# (Guardrails only) Alert when a Guardrails target is unhealthy — the ASG will NOT replace it
+aws cloudwatch put-metric-alarm \
+  --alarm-name "$STACK-guardrails-unhealthy-target" \
+  --metric-name UnHealthyHostCount \
+  --namespace AWS/ApplicationELB \
+  --dimensions \
+    Name=LoadBalancer,Value=<guardrails-alb-arn-suffix> \
+    Name=TargetGroup,Value=<guardrails-tg-arn-suffix> \
+  --statistic Maximum --period 300 --threshold 0 \
+  --comparison-operator GreaterThanThreshold --evaluation-periods 2 \
+  --alarm-description "Guardrails target unhealthy — manual replacement required" \
   --region $REGION
 ```
+
+The `<...-arn-suffix>` values are the `app/<name>/<id>` and `targetgroup/<name>/<id>` portions of
+the ALB and target group ARNs (`aws elbv2 describe-load-balancers` / `describe-target-groups`).
 
 ---
 
 ## Key Operational Commands
 
-### AI Gateway
+Resolve the target group ARNs once and reuse them in the commands below:
 
-| Task | Command |
-|---|---|
-| AIG ASG instance states | `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <stack>-aig-asg --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" --output table --region <region>` |
-| AIG ALB target health | `aws elbv2 describe-target-health --target-group-arn <aig-tg-arn> --output table --region <region>` |
-| AIG activation Lambda logs | `aws logs tail /aws/lambda/<stack>-aig-activation --since 30m --region <region>` |
-| AIG bootstrap secret | `aws secretsmanager get-secret-value --secret-id <stack>-aig-bootstrap --query SecretString --output text --region <region>` |
-| AIG enrolled appliances | Check Netskope portal: **Settings → Security Cloud Platform → AI Gateway** |
-
-### DLP On Demand
-
-| Task | Command |
-|---|---|
-| DLPoD ASG instance states | `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <stack>-dlpod-asg --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" --output table --region <region>` |
-| DLPoD ALB target health | `aws elbv2 describe-target-health --target-group-arn $(aws elbv2 describe-target-groups --names <stack>-dlpod-tg --query "TargetGroups[0].TargetGroupArn" --output text --region <region>) --output table --region <region>` |
-| DLPoD bootstrap builder logs | `aws logs tail /aws/lambda/<stack>-dlpod-bootstrap-builder --since 1h --region <region>` |
-| DLPoD readiness gate logs (stack create) | `aws logs tail /aws/lambda/<stack>-dlpod-readiness --since 1h --region <region>` |
-| Readiness gate result | `aws cloudformation describe-stack-events --stack-name <stack> --query "StackEvents[?LogicalResourceId=='DlpodReadinessGate'].[Timestamp,ResourceStatus,ResourceStatusReason]" --output table --region <region>` |
-| DLPoD CA cert (SSM) | `aws ssm get-parameter --name /<stack>/dlpod-cert --query Parameter.Value --output text --region <region>` |
-| DLPoD service URL | `https://dlp.aigw.internal` (fixed; `DlpodServiceUrl` stack output) — resolvable only inside the VPC |
-
-### AI Guardrails (only when `GuardrailsImageS3Bucket` was set)
-
-| Task | Command |
-|---|---|
-| Guardrails ASG instance states | `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <stack>-guardrails-asg --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" --output table --region <region>` |
-| Guardrails ALB target health | `aws elbv2 describe-target-health --target-group-arn $(aws elbv2 describe-target-groups --query "TargetGroups[?contains(TargetGroupName,'<stack>-guardrails')].TargetGroupArn" --output text --region <region>) --output table --region <region>` |
-| Shell on a Guardrails instance | `aws ssm start-session --target <instance-id> --region <region>` (no SSH key; role has `AmazonSSMManagedInstanceCore`) |
-| Container status / logs | on the instance: `sudo docker ps`, `sudo docker logs guardrails`, `cat /var/log/user-data.log` |
-| Local health check | on the instance: `curl -s http://localhost:8080/ping` → `Healthy` |
-| Health check from an AIG instance | `curl -s http://guardrails.aigw.internal:8080/ping` |
-| Scale Guardrails | `aws autoscaling update-auto-scaling-group --auto-scaling-group-name <stack>-guardrails-asg --desired-capacity <N> --region <region>` |
-| Roll to a new image | Upload the new tarball to S3 (new key), `aws cloudformation update-stack` with the new `GuardrailsImageS3Key`, then start an ASG instance refresh: `aws autoscaling start-instance-refresh --auto-scaling-group-name <stack>-guardrails-asg --region <region>` |
-
-Guardrails instances have no lifecycle hook: a replacement instance pulls the image and starts the
-container from UserData, and the ALB health check (`/ping`, HTTP 200) governs when it receives traffic.
-Grace period is 20 minutes to allow for a multi-GB image pull.
-
-**Get the target group ARNs once and reuse them:**
 ```bash
-STACK=<stack-name>
-REGION=<region>
-
 AIG_TG=$(aws elbv2 describe-target-groups --names $STACK-aig-tg \
   --query "TargetGroups[0].TargetGroupArn" --output text --region $REGION)
 DLPOD_TG=$(aws elbv2 describe-target-groups --names $STACK-dlpod-tg \
   --query "TargetGroups[0].TargetGroupArn" --output text --region $REGION)
+# Guardrails only
+GUARDRAILS_TG=$(aws elbv2 describe-target-groups --names $STACK-guardrails-tg \
+  --query "TargetGroups[0].TargetGroupArn" --output text --region $REGION)
 ```
+
+### AI Gateway
+
+AIG ASG instance states:
+```bash
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names $STACK-aig-asg \
+  --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" \
+  --output table --region $REGION
+```
+
+AIG ALB target health:
+```bash
+aws elbv2 describe-target-health --target-group-arn $AIG_TG --output table --region $REGION
+```
+
+Activation Lambda logs (look for `Registered appliance`, `Traceback`, `ABANDON`):
+```bash
+aws logs tail /aws/lambda/$STACK-aig-activation --since 30m --region $REGION
+```
+
+AIG bootstrap secret (contains the most recent enrollment token — treat as sensitive):
+```bash
+aws secretsmanager get-secret-value --secret-id $STACK-aig-bootstrap \
+  --query SecretString --output text --region $REGION
+```
+
+Enrolled appliances: Netskope console, **Settings → Security Cloud Platform → AI Gateway**.
+
+### DLP On Demand
+
+DLPoD ASG instance states:
+```bash
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names $STACK-dlpod-asg \
+  --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" \
+  --output table --region $REGION
+```
+
+DLPoD ALB target health:
+```bash
+aws elbv2 describe-target-health --target-group-arn $DLPOD_TG --output table --region $REGION
+```
+
+DLPoD bootstrap builder logs (stack create/update only):
+```bash
+aws logs tail /aws/lambda/$STACK-dlpod-bootstrap-builder --since 1h --region $REGION
+```
+
+DLPoD readiness gate logs (stack create only):
+```bash
+aws logs tail /aws/lambda/$STACK-dlpod-readiness --since 1h --region $REGION
+```
+
+Readiness gate result from stack events (both gates):
+```bash
+aws cloudformation describe-stack-events --stack-name $STACK \
+  --query "StackEvents[?LogicalResourceId=='DlpodReadinessGate' || LogicalResourceId=='GuardrailsReadinessGate'].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
+  --output table --region $REGION
+```
+
+DLPoD CA cert (public PEM, from SSM):
+```bash
+aws ssm get-parameter --name /$STACK/dlpod-cert --query Parameter.Value \
+  --output text --region $REGION
+```
+
+DLPoD service URL: `https://dlp.aigw.internal` (fixed; `DlpodServiceUrl` stack output) —
+resolvable only inside the VPC.
+
+### AI Guardrails (only when `GuardrailsImageS3Bucket` was set)
+
+Guardrails ASG instance states:
+```bash
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names $STACK-guardrails-asg \
+  --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" \
+  --output table --region $REGION
+```
+
+Guardrails ALB target health:
+```bash
+aws elbv2 describe-target-health --target-group-arn $GUARDRAILS_TG --output table --region $REGION
+```
+
+Shell on a Guardrails instance (no SSH key; the role has `AmazonSSMManagedInstanceCore`):
+```bash
+aws ssm start-session --target <instance-id> --region $REGION
+```
+
+On the instance — container status, logs, UserData log, and local health check:
+```bash
+sudo docker ps
+sudo docker logs guardrails
+cat /var/log/user-data.log
+curl -s http://localhost:8080/ping        # expect "Healthy"
+```
+
+Confirm the NVMe fast path was used (if the Docker root dir is under `/tmp`, the instance store
+was not found and the slow EBS fallback is in effect):
+```bash
+lsblk -dpno NAME,MODEL
+mountpoint /opt/dlami/nvme
+sudo docker info | grep 'Docker Root Dir'
+```
+
+Health check from an AIG instance's point of view (run from any host in the VPC):
+```bash
+curl -s http://guardrails.aigw.internal:8080/ping
+```
+
+Scale Guardrails:
+```bash
+aws autoscaling set-desired-capacity \
+  --auto-scaling-group-name $STACK-guardrails-asg \
+  --desired-capacity <N> --region $REGION
+```
+
+**Health checks and replacement.** The Guardrails ASG uses `HealthCheckType: EC2` with no grace
+period. The ALB health check (`/ping`, HTTP 200) controls only whether a target receives traffic;
+it does not feed back into the ASG. Consequently, an instance whose container has crashed or hung
+stays `InService`/`Healthy` in the ASG and is never replaced automatically — only an EC2
+status-check failure triggers replacement. Detect this with `describe-target-health` (target
+`unhealthy` while the ASG shows `Healthy`) or the `UnHealthyHostCount` alarm above, then replace
+the instance yourself:
+
+```bash
+# Option A — replace every instance in the ASG one at a time (also picks up launch-template changes)
+aws autoscaling start-instance-refresh \
+  --auto-scaling-group-name $STACK-guardrails-asg --region $REGION
+
+# Option B — replace one instance; the ASG launches a substitute
+aws autoscaling terminate-instance-in-auto-scaling-group \
+  --instance-id <instance-id> --no-should-decrement-desired-capacity --region $REGION
+```
+
+Guardrails instances have no lifecycle hook: a replacement pulls the image and starts the container
+from UserData, then the ALB health check governs when it receives traffic.
+
+**Boot time and the NVMe instance store.** UserData budgets 15 minutes for the container to pass
+`/ping`, and that budget assumes the image tarball and Docker `data-root` are on the local NVMe
+instance store (which is why `GuardrailsInstanceType` is limited to `g4dn`/`g5` sizes). The
+instance store is ephemeral, so every launch — scale-out, replacement, or refresh — re-downloads
+`aisecurity-llm.tgz` from S3 and re-loads it. Keep the bucket in the stack's region; if boots are
+slow, run the `lsblk` / `docker info` check above to confirm the fast path is in use.
+
+Roll to a new container image: upload the new tarball to S3 under a new key, `update-stack` with
+the new `GuardrailsImageS3Key` (all other parameters `UsePreviousValue=true` — see the
+[AMI Upgrade Procedure](#ami-upgrade-procedure) for the full parameter list), then
+`start-instance-refresh` on `<stack>-guardrails-asg`. A stack update alone does not replace
+instances.
 
 ---
 
 ## Scaling
 
+All three ASGs are fixed at `MinSize: 1` / `MaxSize: 4`; the only automatic policy is AIG
+scale-out on CPU. Everything else below is a manual `set-desired-capacity`.
+
 ### Scale AIG out manually
 
 ```bash
 aws autoscaling set-desired-capacity \
-  --auto-scaling-group-name <stack>-aig-asg \
+  --auto-scaling-group-name $STACK-aig-asg \
   --desired-capacity <new-count> \
-  --region <region>
+  --region $REGION
 ```
 
-Each new AIG instance goes through the full enrollment flow (~5–15 minutes). The activation
+Each new AIG instance goes through the full enrollment flow (~5–15 minutes). The Activation
 Lambda writes the enrollment token to the bootstrap secret and completes the lifecycle hook —
 enrollment happens autonomously on the instance from there. Increase desired capacity by one at
 a time: all AIG instances share the single `<stack>-aig-bootstrap` secret, and concurrent launches
@@ -416,153 +559,183 @@ can pick up each other's enrollment token.
 
 ```bash
 aws autoscaling set-desired-capacity \
-  --auto-scaling-group-name <stack>-dlpod-asg \
+  --auto-scaling-group-name $STACK-dlpod-asg \
   --desired-capacity <new-count> \
-  --region <region>
+  --region $REGION
 ```
 
 Each new DLPoD instance bootstraps independently from the same launch template UserData
-(~5–10 minutes until the ALB health check passes). DLPoD instances do not conflict — the
-`bootstrap.json` is identical for every instance and contains no per-instance state. The readiness
-gate does not run on scale-out; watch the DLPoD ALB target health to know when the new instance is
-serving. Concurrent DLPoD launches are safe.
+(~5–10 minutes until the ALB health check passes; longer until fully initialised in the Netskope
+console). DLPoD instances do not conflict — the `bootstrap.json` is identical for every instance
+and contains no per-instance state. The readiness gate does not run on scale-out; watch the DLPoD
+ALB target health to know when the new instance is serving. Concurrent DLPoD launches are safe.
 
 ### Scale in
 
 ```bash
 # AIG scale in
 aws autoscaling set-desired-capacity \
-  --auto-scaling-group-name <stack>-aig-asg \
-  --desired-capacity <new-count> --region <region>
+  --auto-scaling-group-name $STACK-aig-asg \
+  --desired-capacity <new-count> --region $REGION
 
 # DLPoD scale in
 aws autoscaling set-desired-capacity \
-  --auto-scaling-group-name <stack>-dlpod-asg \
-  --desired-capacity <new-count> --region <region>
+  --auto-scaling-group-name $STACK-dlpod-asg \
+  --desired-capacity <new-count> --region $REGION
 ```
 
-AIG termination lifecycle hook fires — the activation Lambda deregisters the appliance from the
-Netskope tenant and deletes the SSM appliance ID parameter. DLPoD has no termination hook — the
-instance is simply terminated and deregistered from the ALB.
+There is no scale-in policy in the template, so capacity added by the CPU alarm stays until you
+reduce it. On AIG scale-in the termination lifecycle hook fires — the Activation Lambda deregisters
+the appliance from the Netskope tenant and deletes the SSM appliance ID parameter. DLPoD has no
+termination hook — the instance is simply terminated and deregistered from the ALB.
 
 ### Update desired capacity via stack update
 
-Both ASGs are fixed at `MinSize: 1` / `MaxSize: 4` in the template. The desired counts are
-parameters and can be changed persistently with a stack update (a manual `set-desired-capacity`
-is reverted on the next stack update that touches the ASG):
+The desired counts are parameters and can be changed persistently with a stack update (a manual
+`set-desired-capacity` is reverted on the next stack update that touches the ASG). Every parameter
+without a default must be carried forward with `UsePreviousValue=true`; the Guardrails parameters
+default to empty, so omitting them on a stack that has Guardrails deployed tears the tier down:
 
 ```bash
 aws cloudformation update-stack \
-  --stack-name <stack-name> \
-  --template-url https://<bucket>.s3.<region>.amazonaws.com/templates/gateway-combined.yaml \
+  --stack-name $STACK \
+  --template-url https://<bucket>.s3.$REGION.amazonaws.com/templates/gateway-combined.yaml \
   --parameters \
     ParameterKey=NetskopeTenantUrl,UsePreviousValue=true \
     ParameterKey=NetskopeApiToken,UsePreviousValue=true \
     ParameterKey=DlpodLicenseKey,UsePreviousValue=true \
     ParameterKey=AcmCertificateArn,UsePreviousValue=true \
+    ParameterKey=GatewayAmiId,UsePreviousValue=true \
+    ParameterKey=DlpodAmiId,UsePreviousValue=true \
     ParameterKey=GuardrailsImageS3Bucket,UsePreviousValue=true \
+    ParameterKey=GuardrailsImageS3Key,UsePreviousValue=true \
     ParameterKey=GuardrailsAmiId,UsePreviousValue=true \
     ParameterKey=DesiredCapacity,ParameterValue=<new-aig-count> \
     ParameterKey=DlpodDesiredCapacity,ParameterValue=<new-dlpod-count> \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region <region>
+  --region $REGION
 ```
 
 ---
 
 ## AMI Upgrade Procedure
 
-When Netskope releases a new AI Gateway or DLP On Demand AMI version, upgrade by updating the
-stack parameter. The ASG performs a rolling instance refresh — existing instances are replaced
-one at a time with new instances running the updated AMI.
+When Netskope releases a new AIG or DLPoD AMI version, upgrade in two steps: update the stack
+parameter (which creates a new launch-template version), then start an instance refresh on the
+ASG. **No ASG in the template has an `UpdatePolicy`, so a stack update by itself does not replace
+running instances** — they keep running the old AMI until you refresh.
 
 **1. Find the new AMI ID:**
 ```bash
 aws ec2 describe-images \
   --filters 'Name=name,Values=*Netskope AI Gateway*' \
   --query 'sort_by(Images, &CreationDate)[-1].[ImageId,Name,CreationDate]' \
-  --output table --region <region>
+  --output table --region $REGION
 ```
 
+For DLPoD the AMI is shared privately to your account from the Netskope console, so list private
+images instead (`aws ec2 describe-images --executable-users self ...`) or read the ID from
+EC2 > AMIs > Private images.
+
 **2. Update the stack with the new AMI:**
+
+Carry every existing parameter forward with `UsePreviousValue=true` — `NetskopeTenantUrl` has no
+default (the update fails without it), and the three Guardrails parameters default to empty
+(omitting them on a stack with Guardrails deployed deletes the tier). Change only the AMI you are
+upgrading:
+
 ```bash
 aws cloudformation update-stack \
-  --stack-name <stack-name> \
-  --template-url https://<bucket>.s3.<region>.amazonaws.com/templates/gateway-combined.yaml \
+  --stack-name $STACK \
+  --template-url https://<bucket>.s3.$REGION.amazonaws.com/templates/gateway-combined.yaml \
   --parameters \
     ParameterKey=NetskopeTenantUrl,UsePreviousValue=true \
     ParameterKey=NetskopeApiToken,UsePreviousValue=true \
     ParameterKey=DlpodLicenseKey,UsePreviousValue=true \
     ParameterKey=AcmCertificateArn,UsePreviousValue=true \
+    ParameterKey=DesiredCapacity,UsePreviousValue=true \
+    ParameterKey=DlpodDesiredCapacity,UsePreviousValue=true \
+    ParameterKey=DlpodAmiId,UsePreviousValue=true \
     ParameterKey=GuardrailsImageS3Bucket,UsePreviousValue=true \
+    ParameterKey=GuardrailsImageS3Key,UsePreviousValue=true \
     ParameterKey=GuardrailsAmiId,UsePreviousValue=true \
     ParameterKey=GatewayAmiId,ParameterValue=<new-aig-ami-id> \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region <region>
+  --region $REGION
+
+aws cloudformation wait stack-update-complete --stack-name $STACK --region $REGION
 ```
 
-**3. What happens:**
-- The ASG launch template is updated with the new AMI
-- CloudFormation triggers an instance refresh on the ASG
-- Each existing AIG instance is terminated; a replacement launches with the new AMI
-- The replacement goes through the full enrollment flow (~5–15 min per instance)
-- The ALB maintains traffic to healthy instances during the rolling replacement
+For a DLPoD upgrade swap the last line for `ParameterKey=DlpodAmiId,ParameterValue=<new-dlpod-ami-id>`
+and set `GatewayAmiId,UsePreviousValue=true`. For a Guardrails AMI upgrade do the same with
+`GuardrailsAmiId`.
+
+**3. Start the instance refresh:**
+```bash
+aws autoscaling start-instance-refresh \
+  --auto-scaling-group-name $STACK-aig-asg --region $REGION
+# or, for the tier you upgraded:
+#   --auto-scaling-group-name $STACK-dlpod-asg
+#   --auto-scaling-group-name $STACK-guardrails-asg
+```
+
+The default refresh keeps 90 % of capacity healthy and replaces instances one at a time. Each AIG
+replacement goes through the full enrollment flow (~5–15 min); each DLPoD replacement re-runs
+`nsbootstrap` from the (unchanged) UserData (~5–10 min to ALB-healthy); each Guardrails
+replacement re-downloads and loads the image (up to 15 min). Because AIG instances share one
+bootstrap secret, do not lower the refresh's `MinHealthyPercentage` in a way that launches two AIG
+instances at once. Plan for reduced capacity during the rollout.
 
 **4. Monitor the refresh:**
 ```bash
 aws autoscaling describe-instance-refreshes \
-  --auto-scaling-group-name <stack>-aig-asg \
+  --auto-scaling-group-name $STACK-aig-asg \
   --query "InstanceRefreshes[0].[Status,PercentageComplete,StatusReason]" \
-  --output table --region <region>
+  --output table --region $REGION
 ```
 
-> **DLP On Demand AMI upgrade:** Use `DlpodAmiId` parameter instead of `GatewayAmiId`. The same
-> process applies — each replaced DLPoD instance bootstraps from the existing launch template
-> UserData and passes the ALB health check in ~5–10 min. Plan for reduced DLP capacity during
-> the rolling upgrade. Monitor with `describe-instance-refreshes` on `<stack>-dlpod-asg` and
-> `describe-target-health` on the DLPoD target group.
+Then confirm with `describe-target-health` on the relevant target group and, for AIG, look for
+`Registered appliance` in `/aws/lambda/<stack>-aig-activation`.
+
+---
+
+## Certificate Renewal
+
+The DLPoD CA and leaf certificates (and the auto-generated AIG ALB certificate, if
+`AcmCertificateArn` was left empty) are valid for 365 days from stack creation. After expiry the
+AIG can no longer verify the DLPoD ALB and DLP inspection fails.
+
+A stack update that re-runs the `DlpodAlbCertificate` custom resource (for example by changing one
+of its properties) regenerates the hierarchy, rewrites `/<stack>/dlpod-cert` and
+`<stack>-dlpod-cert-key`, and rebuilds the DLPoD launch-template UserData. Running instances do
+not pick this up on their own: start an instance refresh on `<stack>-dlpod-asg` (so the appliances
+serve the new leaf) and then on `<stack>-aig-asg` (so the Activation Lambda writes the new CA into
+the bootstrap secret at each relaunch). Schedule this before the anniversary of stack creation.
+Verify the current expiry with:
+
+```bash
+aws ssm get-parameter --name /$STACK/dlpod-cert --query Parameter.Value \
+  --output text --region $REGION | openssl x509 -noout -enddate
+```
 
 ---
 
 ## IAM Roles
 
-| Role | Principal | Purpose |
-|---|---|---|
-| `<stack>-gateway-role` | `ec2.amazonaws.com` | AIG instance role: read `<stack>-aig-bootstrap` secret, `CloudWatchAgentServerPolicy` |
-| `<stack>-aig-activation-role` | `lambda.amazonaws.com` | Read `<stack>-netskope-credentials`, write `<stack>-aig-bootstrap`, read `/<stack>/dlpod-cert`, put/get/delete `/aig/<stack>/*`, `ec2:DescribeInstances`, complete lifecycle hooks on `<stack>-aig-asg` |
-| `<stack>-aig-lifecycle-sns-role` | `autoscaling.amazonaws.com` | Publish AIG lifecycle events to SNS |
-| `<stack>-dlpod-role` | `ec2.amazonaws.com` | DLPoD instance role: `CloudWatchAgentServerPolicy` only — no access to any secret or parameter |
-| `<stack>-dlpod-bootstrap-builder-role` | `lambda.amazonaws.com` | Read `<stack>-dlpod-cert-key` and `<stack>-dlpod-credentials` to assemble `bootstrap.json` UserData |
-| `<stack>-dlpod-readiness-role` | `lambda.amazonaws.com` | `elasticloadbalancing:DescribeTargetHealth` — used by the DLPoD (and Guardrails) readiness gates |
-| `<stack>-certgen-role` | `lambda.amazonaws.com` | Import/delete cert in ACM, write `/<stack>/*` SSM parameters, write `<stack>-dlpod-cert-key` |
-| `<stack>-guardrails-role` *(Guardrails only)* | `ec2.amazonaws.com` | Guardrails instance role: `s3:GetObject` on the image tarball, `AmazonSSMManagedInstanceCore`, CloudWatch |
-
-No IAM role in the stack can SSH to or otherwise log in to a DLPoD instance — DLPoD instances
-accept only HTTPS:443 from the DLPoD ALB security group.
+The eight IAM roles (seven without Guardrails), their principals, and every permission statement
+are documented once in [SECURITY.md — IAM Roles and Permissions](SECURITY.md#iam-roles-and-permissions).
+No role in the stack can SSH to or otherwise log in to an AIG or DLPoD instance.
 
 ---
 
 ## Secrets and SSM Parameters
 
-| Resource | Who reads it | Contents |
-|---|---|---|
-| `<stack>-aig-bootstrap` (Secrets Manager) | AIG instances at boot; AIG activation Lambda writes | `{"bootstrap": true, "enrollment_token": "...", "dlp": {"certificate": "<CA PEM>", "host": "https://dlp.aigw.internal"}}` plus `"ai_guardrails": {"host": "..."}` when Guardrails is deployed |
-| `<stack>-netskope-credentials` (Secrets Manager) | AIG activation Lambda only | `{"tenant_url": "...", "api_token": "..."}` |
-| `<stack>-dlpod-credentials` (Secrets Manager) | DLPoD bootstrap builder Lambda only (stack create/update) | `{"license_key": "..."}` |
-| `<stack>-dlpod-cert-key` (Secrets Manager) | Cert generator Lambda writes; DLPoD bootstrap builder Lambda reads | `{"ca_cert_pem": "...", "leaf_cert_pem": "...", "leaf_key_pem": "..."}` — the leaf cert + key are what DLPoD serves on 443 |
-| `/<stack>/dlpod-cert` (SSM Parameter) | AIG activation Lambda at every AIG launch | PEM-encoded DLPoD CA certificate (365-day validity) — AIG trusts the DLPoD ALB leaf via this CA |
-| `/<stack>/aig-cert` (SSM Parameter) | Operators | AIG ALB self-signed cert PEM — only exists when `AcmCertificateArn` was left empty |
-| `/aig/<stack>/<instance-id>` (SSM) | AIG activation Lambda (termination cleanup) | AIG appliance ID in Netskope tenant |
-
-The DLPoD instance never reads Secrets Manager or SSM: its configuration (including the TLS
-private key and license key) is embedded in the launch template UserData, which is readable by
-anyone with `ec2:DescribeLaunchTemplateVersions` on the account. Treat launch template access
-accordingly.
-
-> **Certificate renewal:** the DLPoD CA and leaf certs are valid for 365 days from stack creation.
-> A stack update that re-runs `DlpodAlbCertificate` (e.g. changing its properties) regenerates the
-> hierarchy, rewrites SSM and `<stack>-dlpod-cert-key`, and rebuilds the DLPoD UserData; DLPoD and
-> AIG instances then need to be replaced (instance refresh) to pick up the new certs.
+The four Secrets Manager secrets and three SSM Parameter Store paths — contents, writer, reader,
+and lifecycle — are documented once in
+[SECURITY.md — What's Stored and Where](SECURITY.md#whats-stored-and-where). Operationally: the
+only secret you normally read is `<stack>-aig-bootstrap` (to confirm the `dlp` block is present),
+and the only parameter is `/<stack>/dlpod-cert` (to check certificate expiry — see
+[Certificate Renewal](#certificate-renewal)).
 
 ---
 
@@ -577,7 +750,10 @@ Quick reference for the most common issues:
 | AIG instance stuck in `Pending:Wait` more than 2 minutes | `/aws/lambda/<stack>-aig-activation` logs |
 | AIG instance ABANDONED | Activation Lambda logs; fix root cause before next replacement launches |
 | DLPoD target never becomes healthy | DLPoD ALB target health; `/aws/lambda/<stack>-dlpod-bootstrap-builder` logs; DLPoD SG/ALB SG rules |
-| Stack rolled back at `DlpodReadinessGate` ("did not become healthy within 14 minutes") | `describe-stack-events`; `/aws/lambda/<stack>-dlpod-readiness` logs; re-create with `--disable-rollback` to inspect |
-| DLP inspection not working (AIG enrolled but no DLP) | Check DLPoD ALB target health; check bootstrap secret has `dlp` block |
-| Scale-out alarm not triggering | `aws cloudwatch describe-alarms --alarm-names <stack>-aig-high-cpu` |
+| Stack rolled back at `DlpodReadinessGate` (`Targets in <stack>-dlpod-tg did not become healthy within 840s`) | `describe-stack-events`; `/aws/lambda/<stack>-dlpod-readiness` logs; re-create with `--disable-rollback` to inspect |
+| Stack rolled back at `GuardrailsReadinessGate` (`Container not healthy after 15 min` / `UserData script failed`) | `describe-stack-events`; `/var/log/user-data.log` on the Guardrails instance via SSM; check S3 bucket region and that the NVMe fast path was used — see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#ai-guardrails-issues) |
+| Guardrails target unhealthy but ASG instance shows `Healthy` | Expected with `HealthCheckType: EC2` — replace manually (see [AI Guardrails](#ai-guardrails-only-when-guardrailsimages3bucket-was-set)) |
+| DLP inspection not working (AIG enrolled but no DLP) | Check DLPoD ALB target health; check bootstrap secret has `dlp` block; confirm appliance is fully initialised in the Netskope console |
+| Scale-out alarm not triggering | `aws cloudwatch describe-alarms --alarm-names <stack>-aig-high-cpu` — steady state is `OK`, not `INSUFFICIENT_DATA` |
+| New AMI parameter applied but instances still on the old AMI | Expected — no `UpdatePolicy`; run `start-instance-refresh` (see [AMI Upgrade Procedure](#ami-upgrade-procedure)) |
 | Stack deletion hanging | Check for instances in `Terminating:Wait`; may need manual `CompleteLifecycleAction` |
